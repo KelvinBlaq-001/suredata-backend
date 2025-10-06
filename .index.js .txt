@@ -1,0 +1,33 @@
+const express = require('express');
+const cors = require('cors');
+const admin = require('firebase-admin');
+const bodyParser = require('body-parser');
+require('dotenv').config();
+
+const app = express();
+app.use(cors());
+app.use(bodyParser.json());
+
+// --- Initialize Firebase ---
+admin.initializeApp({
+  credential: admin.credential.cert(JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)),
+});
+const db = admin.firestore();
+
+// --- Test route ---
+app.get('/', (req, res) => {
+  res.send('✅ SureData Backend is running fine!');
+});
+
+// --- Paystack webhook test route ---
+app.post('/payments/webhook', async (req, res) => {
+  const event = req.body;
+  console.log('Webhook received:', event.event);
+
+  // (Later) handle payment success
+  res.sendStatus(200);
+});
+
+// --- Start server ---
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
