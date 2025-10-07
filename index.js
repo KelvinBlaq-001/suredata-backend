@@ -23,127 +23,82 @@ admin.initializeApp({
 
 const db = admin.firestore();
 
-// --- PAYSTACK WEBHOOK (FINAL FIXED & VERIFIED) ---
+// --- PAYSTACK WEBHOOK (FINAL FIXED) ---
 import crypto from "crypto";
 import bodyParser from "body-parser";
 
-// ✅ Use raw body parser ONLY for this webhook route
-app.post("/api/paystack/webhook", bodyParser.raw({ type: "application/json" }), async (req, res) => {
-  try {
-    const secret = process.env.PAYSTACK_SECRET_KEY;
-    const signature = req.headers["x-paystack-signature"];
+app.post(
+  "/api/paystack/webhook",
+  bodyParser.raw({ type: "application/json" }),
+  async (req, res) => {
+    try {
+      const secret = process.env.PAYSTACK_SECRET_KEY;
+      const signature = req.headers["x-paystack-signature"];
 
-    if (!secret || !signature) {
-      console.error("❌ Missing secret or signature header");
-      return res.status(400).send("Missing signature or secret");
-    }
+      // 🧠 Ensure rawBody is a string or Buffer
+      const rawBody = Buffer.isBuffer(req.body)
+        ? req.body
+        : Buffer.from(JSON.stringify(req.body));
 
-    // ✅ Compute HMAC hash using raw buffer
-    const hash = crypto.createHmac("sha512", secret).update(req.body).digest("hex");
+      // ✅ Verify HMAC signature using raw buffer
+      const hash = crypto
+        .createHmac("sha512", secret)
+        .update(rawBody)
+        .digest("hex");
 
-    if (hash !== signature) {
-      console.warn("⚠️ Invalid Paystack signature");
-      return res.status(400).send("Invalid signature");
-    }
-
-    // ✅ Parse verified event JSON
-    const event = JSON.parse(req.body.toString());
-    console.log("📩 Paystack event:", event.event);
-
-    if (event.event === "charge.success") {
-      const { customer, amount, reference } = event.data;
-      const email = customer?.email;
-
-      if (!email) {
-        console.warn("⚠️ No customer email in event data");
-        return res.sendStatus(400);
+      if (hash !== signature) {
+        console.error("❌ Invalid Paystack signature");
+        return res.status(400).send("Invalid signature");
       }
 
-      console.log(`💰 Payment received from ${email} → ₦${amount / 100}`);
+      // ✅ Parse event safely
+      const event = JSON.parse(rawBody.toString());
 
-      // 🔍 Identify plan by amount (amount is in kobo)
-      let selectedPlan = null;
-      switch (amount) {
-        case 50000:
-          selectedPlan = "N500";
-          break;
-        case 100000:
-          selectedPlan = "N1000";
-          break;
-        case 200000:
-          selectedPlan = "N2000";
-          break;
-        case 500000:
-          selectedPlan = "N5000";
-          break;
-      }
+      if (event.event === "charge.success") {
+        const { email, amount } = event.data;
+        const uid = email.split("@")[0];
 
-      // 🔄 Find Firestore user by email
-      const usersRef = db.collection("users");
-      const userSnapshot = await usersRef.where("email", "==", email).limit(1).get();
+        let selectedPlan = null;
+        if (amount === 50000) selectedPlan = "N500";
+        else if (amount === 100000) selectedPlan = "N1000";
+        else if (amount === 200000) selectedPlan = "N2000";
+        else if (amount === 500000) selectedPlan = "N5000";
 
-      if (userSnapshot.empty) {
-        console.warn("⚠️ User not found for:", email);
-      } else {
-        const userDoc = userSnapshot.docs[0];
-        const userRef = userDoc.ref;
+        if (selectedPlan) {
+          const userRef = db.collection("users").doc(uid);
+          const userSnap = await userRef.get();
 
-        await db.runTransaction(async (t) => {
-          const doc = await t.get(userRef);
-          if (!doc.exists) throw new Error("User not found");
+          if (userSnap.exists) {
+            const expiryDate = new Date();
+            expiryDate.setDate(expiryDate.getDate() + 30);
 
-          const user = doc.data();
-          const expiryDate = new Date();
-          expiryDate.setDate(expiryDate.getDate() + 30);
+            await userRef.update({
+              currentPlan: selectedPlan,
+              planLimit:
+                selectedPlan === "N500"
+                  ? 1
+                  : selectedPlan === "N1000"
+                  ? 3
+                  : selectedPlan === "N2000"
+                  ? 8
+                  : 20,
+              expiryDate: expiryDate.toISOString(),
+              dataUsed: 0,
+            });
 
-          // ✅ Credit balance or activate plan
-          const updates = {
-            balance: (user.balance || 0) + amount / 100,
-            lastPayment: {
-              reference,
-              amount: amount / 100,
-              date: new Date().toISOString(),
-            },
-          };
-
-          if (selectedPlan) {
-            updates.currentPlan = selectedPlan;
-            updates.planLimit =
-              selectedPlan === "N500"
-                ? 1
-                : selectedPlan === "N1000"
-                ? 3
-                : selectedPlan === "N2000"
-                ? 8
-                : 20;
-            updates.expiryDate = expiryDate.toISOString();
-            updates.dataUsed = 0;
+            console.log(`✅ Plan auto-activated for ${email}`);
           }
-
-          t.update(userRef, updates);
-
-          // Log transaction
-          const txRef = db.collection("transactions").doc(reference);
-          t.set(txRef, {
-            email,
-            reference,
-            amount: amount / 100,
-            status: "success",
-            plan: selectedPlan,
-            timestamp: new Date().toISOString(),
-          });
-        });
-
-        console.log(`✅ ${selectedPlan ? "Plan activated" : "Balance updated"} for ${email}`);
+        }
       }
-    }
 
-    res.sendStatus(200);
-  } catch (error) {
-    console.error("❌ Webhook error:", error);
-    res.sendStatus(500);
+      res.sendStatus(200);
+    } catch (error) {
+      console.error("❌ Webhook error:", error);
+      res.sendStatus(500);
+    }
   }
-});
+);
+
 
 
 
