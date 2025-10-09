@@ -226,7 +226,7 @@ app.post("/vpn/session/disconnect", async (req, res) => {
 });
 
 // ---- AUTO EXPIRE CHECK ----
-app.post("/cron/expire-check", async (req, res) => {
+app.all("/cron/expire-check", async (req, res) => {
   try {
     const now = new Date();
     const usersSnap = await firestore.collection("users").get();
