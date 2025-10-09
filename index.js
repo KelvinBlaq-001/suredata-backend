@@ -23,24 +23,22 @@ if (!admin.apps.length) {
     credential: admin.credential.cert(serviceAccount),
   });
 }
-const firestore = admin.firestore();
+
+const db = admin.firestore();
 
 // --- Helper: find user by identifier (username | email | phone)
 async function findUserDocByIdentifier(identifier) {
   if (!identifier) return null;
-  const users = firestore.collection("users");
+  const users = db.collection("users");
 
-  // try username
   let snap = await users.where("username", "==", identifier).limit(1).get();
   if (!snap.empty) return snap.docs[0];
 
-  // if it looks like an email
   if (identifier.includes("@")) {
     snap = await users.where("email", "==", identifier.toLowerCase()).limit(1).get();
     if (!snap.empty) return snap.docs[0];
   }
 
-  // finally try phone
   snap = await users.where("phone", "==", identifier).limit(1).get();
   if (!snap.empty) return snap.docs[0];
 
@@ -79,8 +77,7 @@ app.post("/payments/webhook", async (req, res) => {
       if (email) userDoc = await findUserDocByIdentifier(email);
       if (!userDoc && phone) userDoc = await findUserDocByIdentifier(phone);
 
-      // Always log transaction, even if user not found
-      await firestore.collection("transactions").doc(reference).set({
+      await db.collection("transactions").doc(reference).set({
         email: email || null,
         phone: phone || null,
         reference,
@@ -95,26 +92,25 @@ app.post("/payments/webhook", async (req, res) => {
       }
 
       const userRef = userDoc.ref;
-      const user = userDoc.data();
 
-      // Plan mapping (amount → MB and days)
+      // Plan mapping
       const plans = {
         500: { name: "N500", dataLimitMB: 1024, days: 3 },
         1000: { name: "N1000", dataLimitMB: 3072, days: 7 },
         2000: { name: "N2000", dataLimitMB: 8192, days: 15 },
-        5000: { name: "N5000", dataLimitMB: 20480, days: 30 },
+        5000: { name: "N5000", dataLimitMB: 20480, days: 30 }, // ✅ added
       };
 
       const plan = plans[amount] || null;
+      const now = new Date();
 
-      await firestore.runTransaction(async (t) => {
+      await db.runTransaction(async (t) => {
         const snap = await t.get(userRef);
         if (!snap.exists) throw new Error("User not found during transaction");
         const u = snap.data();
 
-        const now = new Date();
         const oldExpiry = u.expiryDate ? new Date(u.expiryDate) : null;
-        let expiryDate =
+        const expiryDate =
           oldExpiry && oldExpiry > now
             ? new Date(oldExpiry.getTime() + (plan?.days || 0) * 86400000)
             : new Date(now.getTime() + (plan?.days || 0) * 86400000);
@@ -134,18 +130,6 @@ app.post("/payments/webhook", async (req, res) => {
         }
 
         t.update(userRef, updates);
-
-        // log transaction details
-        t.set(firestore.collection("transactions").doc(reference), {
-          uid: userRef.id,
-          email: u.email || null,
-          phone: u.phone || null,
-          reference,
-          amount,
-          plan: plan?.name || null,
-          status: "success",
-          timestamp: now.toISOString(),
-        });
       });
 
       console.log(`✅ ${email || phone}: Plan ${plan?.name || "Balance only"} applied successfully`);
@@ -229,7 +213,7 @@ app.post("/vpn/session/disconnect", async (req, res) => {
 app.all("/cron/expire-check", async (req, res) => {
   try {
     const now = new Date();
-    const usersSnap = await firestore.collection("users").get();
+    const usersSnap = await db.collection("users").get();
 
     for (const doc of usersSnap.docs) {
       const user = doc.data();
@@ -251,41 +235,40 @@ app.all("/cron/expire-check", async (req, res) => {
   }
 });
 
-// 🔁 Cron: Sync active VPN users with Tailscale
+// ---- TAILSCALE SYNC ----
 app.all("/cron/tailscale-sync", async (req, res) => {
   try {
-    console.log("Running Tailscale sync job...");
-
+    console.log("🔄 Running Tailscale sync job...");
     const usersRef = db.collection("users");
-    const snapshot = await usersRef.where("currentPlan", "!=", null).get();
+    const snapshot = await usersRef.get();
 
     if (snapshot.empty) {
-      console.log("No users to sync with Tailscale.");
+      console.log("No users found in Firestore.");
       return res.status(200).send("No users to sync.");
     }
 
-    // Example: You could sync them to your VPN or external system here
-    // For now, just log them
     const syncedUsers = [];
-    snapshot.forEach(doc => {
+
+    snapshot.forEach((doc) => {
       const user = doc.data();
-      syncedUsers.push({
-        uid: doc.id,
-        username: user.email || user.phone,
-        plan: user.currentPlan,
-        expiryDate: user.expiryDate,
-      });
+      if (user.currentPlan && user.vpnActive) {
+        syncedUsers.push({
+          uid: doc.id,
+          username: user.email || user.phone || user.username,
+          plan: user.currentPlan,
+          expiryDate: user.expiryDate || null,
+        });
+      }
     });
 
-    console.log("Synced users:", syncedUsers.length);
+    console.log(`✅ Synced ${syncedUsers.length} users with Tailscale.`);
     res.status(200).send(`Tailscale sync complete. Synced ${syncedUsers.length} users.`);
   } catch (error) {
-    console.error("Error during Tailscale sync:", error);
-    res.status(500).send("Tailscale sync failed.");
+    console.error("❌ Error during Tailscale sync:", error);
+    res.status(500).send(`Tailscale sync failed: ${error.message}`);
   }
 });
 
-
 // ---- START SERVER ----
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`✅ SureData backend running on port ${PORT}`));
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`🚀 SureData backend running on port ${PORT}`));
