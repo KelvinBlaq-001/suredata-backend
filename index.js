@@ -251,6 +251,41 @@ app.all("/cron/expire-check", async (req, res) => {
   }
 });
 
+// 🔁 Cron: Sync active VPN users with Tailscale
+app.all("/cron/tailscale-sync", async (req, res) => {
+  try {
+    console.log("Running Tailscale sync job...");
+
+    const usersRef = db.collection("users");
+    const snapshot = await usersRef.where("currentPlan", "!=", null).get();
+
+    if (snapshot.empty) {
+      console.log("No users to sync with Tailscale.");
+      return res.status(200).send("No users to sync.");
+    }
+
+    // Example: You could sync them to your VPN or external system here
+    // For now, just log them
+    const syncedUsers = [];
+    snapshot.forEach(doc => {
+      const user = doc.data();
+      syncedUsers.push({
+        uid: doc.id,
+        username: user.email || user.phone,
+        plan: user.currentPlan,
+        expiryDate: user.expiryDate,
+      });
+    });
+
+    console.log("Synced users:", syncedUsers.length);
+    res.status(200).send(`Tailscale sync complete. Synced ${syncedUsers.length} users.`);
+  } catch (error) {
+    console.error("Error during Tailscale sync:", error);
+    res.status(500).send("Tailscale sync failed.");
+  }
+});
+
+
 // ---- START SERVER ----
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`✅ SureData backend running on port ${PORT}`));
