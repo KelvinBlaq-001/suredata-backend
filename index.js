@@ -1,4 +1,4 @@
-// index.js - SureData backend (final updated)
+// index.js — SureData Backend (Final Production Version)
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -49,123 +49,112 @@ async function findUserDocByIdentifier(identifier) {
 
 // ---- Root route ----
 app.get("/", (req, res) => {
-  res.json({ success: true, message: "SureData backend running" });
+  res.json({ success: true, message: "✅ SureData backend is running" });
 });
 
 // ---- PAYSTACK WEBHOOK ----
-// Note: Paystack sends amount in kobo. We divide by 100 to get Naira.
 app.post("/payments/webhook", async (req, res) => {
   try {
     const secret = process.env.PAYSTACK_SECRET_KEY;
     if (!secret) return res.status(500).send("Missing Paystack secret");
 
-    // Compute HMAC from JSON string (works if your incoming JSON formatting matches Paystack's)
     const hash = crypto.createHmac("sha512", secret).update(JSON.stringify(req.body)).digest("hex");
     if (hash !== req.headers["x-paystack-signature"]) {
-      console.warn("Invalid Paystack signature");
+      console.warn("⚠️ Invalid Paystack signature");
       return res.status(400).send("Invalid signature");
     }
 
-    const event = req.body.event;
-    const data = req.body.data;
+    const { event, data } = req.body;
 
     if (event === "charge.success") {
       const email = data.customer?.email?.toLowerCase?.() || null;
       const phone = data.customer?.phone || null;
-      const amount = data.amount / 100; // to Naira
+      const amount = data.amount / 100;
       const reference = data.reference;
 
-      console.log(`Paystack charge.success: ${email || phone} ₦${amount}`);
+      console.log(`💰 Payment received from ${email || phone}: ₦${amount}`);
 
-      // resolve user by email or phone (prefer email)
+      // Find user by email or phone
       let userDoc = null;
       if (email) userDoc = await findUserDocByIdentifier(email);
       if (!userDoc && phone) userDoc = await findUserDocByIdentifier(phone);
 
+      // Always log transaction, even if user not found
+      await firestore.collection("transactions").doc(reference).set({
+        email: email || null,
+        phone: phone || null,
+        reference,
+        amount,
+        status: "success",
+        timestamp: new Date().toISOString(),
+      });
+
       if (!userDoc) {
-        console.warn("No user found for payment:", email || phone);
-        // still record transaction
-        await firestore.collection("transactions").doc(reference).set({
-          email: email || null,
-          phone: phone || null,
-          reference,
-          amount,
-          status: "success",
-          plan: null,
-          timestamp: new Date().toISOString(),
-        });
-        return res.status(200).send("User not found - transaction recorded");
+        console.warn(`⚠️ No user found for payment: ${email || phone}`);
+        return res.status(200).send("Transaction recorded without user");
       }
 
       const userRef = userDoc.ref;
       const user = userDoc.data();
 
-      // Plan mapping (Naira -> MB)
+      // Plan mapping (amount → MB and days)
       const plans = {
-        500: { name: "N500", dataLimitMB: 1024, days: 30 },     // 1 GB
-        1000: { name: "N1000", dataLimitMB: 3072, days: 30 },   // 3 GB
-        2000: { name: "N2000", dataLimitMB: 8192, days: 30 },   // 8 GB
-        5000: { name: "N5000", dataLimitMB: 20480, days: 30 },  // 20 GB
+        500: { name: "N500", dataLimitMB: 1024, days: 3 },
+        1000: { name: "N1000", dataLimitMB: 3072, days: 7 },
+        2000: { name: "N2000", dataLimitMB: 8192, days: 15 },
+        5000: { name: "N5000", dataLimitMB: 20480, days: 30 },
       };
 
       const plan = plans[amount] || null;
 
-      // Perform transaction atomically
       await firestore.runTransaction(async (t) => {
-        const snapshot = await t.get(userRef);
-        if (!snapshot.exists) throw new Error("User disappeared");
-        const u = snapshot.data();
+        const snap = await t.get(userRef);
+        if (!snap.exists) throw new Error("User not found during transaction");
+        const u = snap.data();
 
-        // credit balance (optional)
-        const newBalance = (u.balance || 0) + amount;
+        const now = new Date();
+        const oldExpiry = u.expiryDate ? new Date(u.expiryDate) : null;
+        let expiryDate =
+          oldExpiry && oldExpiry > now
+            ? new Date(oldExpiry.getTime() + (plan?.days || 0) * 86400000)
+            : new Date(now.getTime() + (plan?.days || 0) * 86400000);
 
         const updates = {
-          balance: newBalance,
-          lastPayment: { reference, amount, date: new Date().toISOString() },
+          balance: (u.balance || 0) + amount,
+          lastPayment: { reference, amount, date: now.toISOString() },
+          updatedAt: now.toISOString(),
         };
 
         if (plan) {
-          // Auto-renew: extend expiry if still active, or set new expiry
-          const now = new Date();
-          const oldExpiry = u.expiryDate ? new Date(u.expiryDate) : null;
-          let expiryDate;
-          if (oldExpiry && oldExpiry > now) {
-            expiryDate = new Date(oldExpiry.getTime() + plan.days * 24 * 60 * 60 * 1000);
-          } else {
-            expiryDate = new Date(now.getTime() + plan.days * 24 * 60 * 60 * 1000);
-          }
-
           updates.currentPlan = plan.name;
-          // stack data: add plan data to existing remaining quota
           updates.planLimit = (u.planLimit || 0) + plan.dataLimitMB;
-          updates.dataUsed = 0; // optionally reset or keep prior usage — we reset here for cleaner UX
+          updates.dataUsed = 0;
           updates.expiryDate = expiryDate.toISOString();
           updates.vpnActive = true;
         }
 
         t.update(userRef, updates);
 
-        // record transaction doc
-        const txRef = firestore.collection("transactions").doc(reference);
-        t.set(txRef, {
+        // log transaction details
+        t.set(firestore.collection("transactions").doc(reference), {
           uid: userRef.id,
           email: u.email || null,
           phone: u.phone || null,
           reference,
           amount,
+          plan: plan?.name || null,
           status: "success",
-          plan: plan ? plan.name : null,
-          timestamp: new Date().toISOString(),
+          timestamp: now.toISOString(),
         });
       });
 
-      console.log(`✅ Payment processed and ${plan ? "plan applied" : "balance updated"} for user`);
+      console.log(`✅ ${email || phone}: Plan ${plan?.name || "Balance only"} applied successfully`);
       return res.status(200).send("OK");
     }
 
     res.status(200).send("Ignored event");
   } catch (err) {
-    console.error("Webhook error:", err);
+    console.error("❌ Webhook error:", err);
     res.status(500).send("Server error");
   }
 });
@@ -178,7 +167,7 @@ app.post("/vpn/session/connect", async (req, res) => {
 
     const userDoc = await findUserDocByIdentifier(username);
     if (!userDoc) {
-      console.warn("Connect: user not found:", username);
+      console.warn(`⚠️ Connect: user not found: ${username}`);
       return res.status(404).send("User not found");
     }
 
@@ -188,10 +177,10 @@ app.post("/vpn/session/connect", async (req, res) => {
       lastConnectedAt: new Date().toISOString(),
     });
 
-    console.log(`🟢 ${username} connected (IP ${vpn_ip || "unknown"})`);
+    console.log(`🟢 ${username} connected (${vpn_ip || "no IP"})`);
     res.status(200).send("OK");
   } catch (err) {
-    console.error("Connect error:", err);
+    console.error("❌ Connect error:", err);
     res.status(500).send("Server error");
   }
 });
@@ -199,53 +188,44 @@ app.post("/vpn/session/connect", async (req, res) => {
 // ---- VPN DISCONNECT ----
 app.post("/vpn/session/disconnect", async (req, res) => {
   try {
-    const { username, bytes_sent = 0, bytes_received = 0, dataUsedMB /* optional */ } = req.body;
+    const { username, bytes_sent = 0, bytes_received = 0 } = req.body;
     if (!username) return res.status(400).send("Missing username");
 
     const userDoc = await findUserDocByIdentifier(username);
     if (!userDoc) {
-      console.warn("Disconnect: user not found:", username);
+      console.warn(`⚠️ Disconnect: user not found: ${username}`);
       return res.status(404).send("User not found");
     }
 
-    const uSnap = await userDoc.ref.get();
-    const user = uSnap.data();
-
-    // determine MB used: prefer explicit dataUsedMB, else compute from bytes
-    let usedMB = 0;
-    if (typeof dataUsedMB === "number") usedMB = dataUsedMB;
-    else usedMB = (Number(bytes_sent || 0) + Number(bytes_received || 0)) / (1024 * 1024);
-
+    const user = (await userDoc.ref.get()).data();
+    const usedMB = (Number(bytes_sent) + Number(bytes_received)) / (1024 * 1024);
     const newDataUsed = (user.dataUsed || 0) + usedMB;
-    const remaining = (user.planLimit || 0) - newDataUsed;
-    const stillActive = remaining > 0 && user.expiryDate && new Date(user.expiryDate) > new Date();
 
-    const updates = {
+    const expired = user.expiryDate && new Date(user.expiryDate) < new Date();
+    const dataExhausted = (user.planLimit || 0) > 0 && newDataUsed >= user.planLimit;
+    const stillActive = !expired && !dataExhausted;
+
+    await userDoc.ref.update({
       dataUsed: newDataUsed,
       vpnActive: stillActive,
       lastDisconnect: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-    };
+    });
 
-    // auto-disable fully if exhausted or expired
-    if (!stillActive) {
-      updates.vpnActive = false;
-      // Optionally clear plan fields:
-      // updates.currentPlan = null;
-      // updates.planLimit = 0;
-    }
+    console.log(
+      `📡 ${username} disconnected — used ${usedMB.toFixed(2)} MB, total ${newDataUsed.toFixed(
+        2
+      )} MB. Active: ${stillActive}`
+    );
 
-    await userDoc.ref.update(updates);
-
-    console.log(`📡 ${username} disconnected — used ${usedMB.toFixed(2)} MB (total ${newDataUsed.toFixed(2)} MB)`);
     res.status(200).send("OK");
   } catch (err) {
-    console.error("Disconnect error:", err);
+    console.error("❌ Disconnect error:", err);
     res.status(500).send("Server error");
   }
 });
 
-// ---- AUTO EXPIRE & DATA-EXHAUSTION CHECK ----
+// ---- AUTO EXPIRE CHECK ----
 app.post("/cron/expire-check", async (req, res) => {
   try {
     const now = new Date();
@@ -258,13 +238,15 @@ app.post("/cron/expire-check", async (req, res) => {
 
       if (expired || dataExhausted) {
         await doc.ref.update({ vpnActive: false });
-        console.log(`🔴 Auto-disabled ${user.username || user.email}: expired(${expired}) dataExhausted(${dataExhausted})`);
+        console.log(
+          `🔴 Auto-disabled ${user.username || user.email}: expired=${expired}, exhausted=${dataExhausted}`
+        );
       }
     }
 
     res.status(200).send("OK");
   } catch (err) {
-    console.error("Expiry check error:", err);
+    console.error("❌ Expiry check error:", err);
     res.status(500).send("Server error");
   }
 });
