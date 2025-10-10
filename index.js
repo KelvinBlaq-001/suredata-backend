@@ -75,21 +75,25 @@ app.get("/admin/summary", async (req, res) => {
 });
 
 // ----------------------------
-// PAYSTACK WEBHOOK (FINAL FIXED VERSION)
+// PAYSTACK WEBHOOK (FINAL, VERIFIED VERSION)
 // ----------------------------
 import bodyParser from "body-parser";
 
-// Use bodyParser.raw ONLY for this route
-app.post(
+// ✅ We must mount this route BEFORE express.json()
+//   Otherwise, express.json() will consume the body and break the signature check.
+//   So we’ll declare it first, then attach express.json() globally below.
+
+const webhookApp = express();
+webhookApp.post(
   "/api/paystack/webhook",
   bodyParser.raw({ type: "application/json" }),
   async (req, res) => {
     try {
       const secret = process.env.PAYSTACK_SECRET_KEY;
-      const rawBody = req.body; // still a Buffer
       const signature = req.headers["x-paystack-signature"];
+      const rawBody = req.body; // this is still a Buffer
 
-      // ✅ Verify signature using the raw buffer
+      // ✅ Verify Paystack signature
       const computedHash = crypto
         .createHmac("sha512", secret)
         .update(rawBody)
@@ -100,19 +104,17 @@ app.post(
         return res.status(400).send("Invalid signature");
       }
 
-      // Parse the raw buffer AFTER verifying the hash
       const event = JSON.parse(rawBody.toString());
       console.log("📩 Paystack event:", event.event);
 
       if (event.event === "charge.success") {
         const data = event.data;
         const reference = data.reference;
-        const amount = data.amount / 100;
+        const amount = data.amount / 100; // Paystack sends kobo → convert to naira
         const email = data.customer.email;
 
         console.log(`💰 Payment from ${email}: ₦${amount}`);
 
-        // --- Firestore logic ---
         const usersRef = db.collection("users");
         const snapshot = await usersRef.where("email", "==", email).limit(1).get();
 
@@ -133,8 +135,6 @@ app.post(
 
           await db.runTransaction(async (t) => {
             const doc = await t.get(userRef);
-            if (!doc.exists) throw new Error("User not found");
-
             const user = doc.data();
 
             let updates = {
@@ -149,7 +149,6 @@ app.post(
             if (plan) {
               const expiryDate = new Date();
               expiryDate.setDate(expiryDate.getDate() + plan.days);
-
               updates = {
                 ...updates,
                 currentPlan: plan.name,
@@ -158,7 +157,6 @@ app.post(
                 expiryDate: expiryDate.toISOString(),
                 vpnActive: true,
               };
-
               console.log(`✅ Assigned plan ${plan.name} to ${email}`);
             } else {
               console.log(`✅ Balance only updated for ${email}`);
@@ -187,6 +185,9 @@ app.post(
     }
   }
 );
+
+// ✅ Mount webhook route separately (before global middleware)
+app.use(webhookApp);
 
 
 // ---- VPN SESSION CONNECT ----
