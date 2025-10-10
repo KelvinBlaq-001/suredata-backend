@@ -74,32 +74,30 @@ app.get("/admin/summary", async (req, res) => {
   }
 });
 
-// ----------------------------
-// PAYSTACK WEBHOOK (FINAL, VERIFIED VERSION)
-// ----------------------------
-import bodyParser from "body-parser";
 
-// ✅ We must mount this route BEFORE express.json()
-//   Otherwise, express.json() will consume the body and break the signature check.
-//   So we’ll declare it first, then attach express.json() globally below.
-
-const webhookApp = express();
-webhookApp.post(
-  "/api/paystack/webhook",
-  bodyParser.raw({ type: "application/json" }),
+// ---------------------------- 
+// PAYSTACK WEBHOOK
+// ----------------------------
+app.post(
+  "/payments/webhook",
+  express.raw({ type: "application/json" }),
   async (req, res) => {
     try {
       const secret = process.env.PAYSTACK_SECRET_KEY;
-      const signature = req.headers["x-paystack-signature"];
-      const rawBody = req.body; // this is still a Buffer
 
-      // ✅ Verify Paystack signature
+      // Get raw body
+      const rawBody = Buffer.isBuffer(req.body)
+        ? req.body
+        : Buffer.from(JSON.stringify(req.body));
+
+      // Verify signature
       const computedHash = crypto
         .createHmac("sha512", secret)
         .update(rawBody)
         .digest("hex");
+      const receivedHash = req.headers["x-paystack-signature"];
 
-      if (computedHash !== signature) {
+      if (computedHash !== receivedHash) {
         console.warn("⚠️ Invalid Paystack signature");
         return res.status(400).send("Invalid signature");
       }
@@ -110,11 +108,12 @@ webhookApp.post(
       if (event.event === "charge.success") {
         const data = event.data;
         const reference = data.reference;
-        const amount = data.amount / 100; // Paystack sends kobo → convert to naira
+        const amount = data.amount / 100; // Paystack sends in kobo
         const email = data.customer.email;
 
         console.log(`💰 Payment from ${email}: ₦${amount}`);
 
+        // Firestore: Find user by email
         const usersRef = db.collection("users");
         const snapshot = await usersRef.where("email", "==", email).limit(1).get();
 
@@ -124,19 +123,21 @@ webhookApp.post(
           const userDoc = snapshot.docs[0];
           const userRef = userDoc.ref;
 
+          // ✅ Correct plans mapping
           const plans = {
-            500: { name: "1GB", dataLimit: 1 * 1024, days: 30 },
-            1000: { name: "3GB", dataLimit: 3 * 1024, days: 30 },
-            2000: { name: "8GB", dataLimit: 8 * 1024, days: 30 },
-            5000: { name: "20GB", dataLimit: 20 * 1024, days: 30 },
+            500: { name: "1GB", dataLimit: 1 * 1024, days: 30 },     // 1GB
+            1000: { name: "3GB", dataLimit: 3 * 1024, days: 30 },    // 3GB
+            2000: { name: "8GB", dataLimit: 8 * 1024, days: 30 },    // 8GB
+            5000: { name: "20GB", dataLimit: 20 * 1024, days: 30 },  // 20GB
           };
 
           const plan = plans[amount];
 
           await db.runTransaction(async (t) => {
             const doc = await t.get(userRef);
-            const user = doc.data();
+            if (!doc.exists) throw new Error("User not found");
 
+            const user = doc.data();
             let updates = {
               balance: (user.balance || 0) + amount,
               lastPayment: {
@@ -149,21 +150,25 @@ webhookApp.post(
             if (plan) {
               const expiryDate = new Date();
               expiryDate.setDate(expiryDate.getDate() + plan.days);
+
               updates = {
                 ...updates,
                 currentPlan: plan.name,
-                planLimit: plan.dataLimit,
+                planLimit: plan.dataLimit, // stored in MB
                 dataUsed: 0,
                 expiryDate: expiryDate.toISOString(),
                 vpnActive: true,
               };
+
               console.log(`✅ Assigned plan ${plan.name} to ${email}`);
             } else {
               console.log(`✅ Balance only updated for ${email}`);
             }
 
+            // Update user profile
             t.update(userRef, updates);
 
+            // Add transaction record
             const txRef = db.collection("transactions").doc(reference);
             t.set(txRef, {
               uid: userDoc.id,
@@ -180,14 +185,11 @@ webhookApp.post(
 
       res.sendStatus(200);
     } catch (error) {
-      console.error("❌ Webhook error:", error);
+      console.error("❌ Webhook error:", error.message);
       res.sendStatus(500);
     }
   }
 );
-
-// ✅ Mount webhook route separately (before global middleware)
-app.use(webhookApp);
 
 
 // ---- VPN SESSION CONNECT ----
