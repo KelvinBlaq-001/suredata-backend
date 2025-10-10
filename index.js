@@ -198,24 +198,35 @@ app.use(express.json());
 app.post("/vpn/session/connect", async (req, res) => {
   try {
     const { username, vpn_ip } = req.body;
-    if (!username) return res.status(400).send("Missing username");
+    console.log("🟢 VPN Connect triggered for:", username, vpn_ip);
+    console.log("🔥 TEST LOG — Connect endpoint reached");
 
-    const userDoc = await findUserDocByIdentifier(username);
-    if (!userDoc) return res.status(404).send("User not found");
 
-    await userDoc.ref.update({
+    const usersRef = db.collection("users");
+    const snapshot = await usersRef.where("email", "==", username).limit(1).get();
+
+    if (snapshot.empty) {
+      console.log("⚠️ No user found for:", username);
+      return res.status(404).json({ error: "User not found" });
+    }
+
+    const userDoc = snapshot.docs[0];
+    const userRef = userDoc.ref;
+
+    await userRef.update({
       vpnActive: true,
-      lastConnectedIP: vpn_ip || null,
-      lastConnectedAt: new Date().toISOString(),
+      vpnIP: vpn_ip,
+      lastConnect: new Date().toISOString(),
     });
 
-    console.log(`🟢 Connected: ${username} (${vpn_ip || "no ip"})`);
-    res.status(200).json({ success: true });
-  } catch (err) {
-    console.error("Connect error:", err);
-    res.status(500).json({ error: err.message });
+    console.log(`✅ Updated user ${username} as connected`);
+    res.json({ success: true });
+  } catch (error) {
+    console.error("❌ Connect error:", error.message);
+    res.status(500).json({ error: error.message });
   }
 });
+
 
 // ---- VPN SESSION DISCONNECT ----
 app.post("/vpn/session/disconnect", async (req, res) => {
