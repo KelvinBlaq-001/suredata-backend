@@ -77,7 +77,6 @@ app.get("/admin/summary", async (req, res) => {
 // ---------------------------- 
 // PAYSTACK WEBHOOK (FIXED VERSION)
 // ----------------------------
-import crypto from "crypto";
 
 // We handle Paystack webhooks separately with raw body parser
 app.post("/api/paystack/webhook", express.raw({ type: "application/json" }), async (req, res) => {
