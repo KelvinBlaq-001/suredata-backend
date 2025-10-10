@@ -74,108 +74,112 @@ app.get("/admin/summary", async (req, res) => {
   }
 });
 
-// ---- PAYSTACK WEBHOOK ----
-// Use raw body to compute HMAC correctly.
-app.post("/payments/webhook", express.raw({ type: "application/json" }), async (req, res) => {
+// ---------------------------- 
+// PAYSTACK WEBHOOK (FIXED VERSION)
+// ----------------------------
+import crypto from "crypto";
+
+// We handle Paystack webhooks separately with raw body parser
+app.post("/api/paystack/webhook", express.raw({ type: "application/json" }), async (req, res) => {
   try {
     const secret = process.env.PAYSTACK_SECRET_KEY;
-    if (!secret) {
-      console.error("Missing PAYSTACK_SECRET_KEY");
-      return res.status(500).send("Missing Paystack secret");
-    }
+    const rawBody = req.body; // already a Buffer from express.raw()
 
-    const receivedSig = req.headers["x-paystack-signature"] || "";
-    const computed = crypto.createHmac("sha512", secret).update(req.body).digest("hex");
-    if (computed !== receivedSig) {
-      console.warn("Invalid Paystack signature");
+    const computedHash = crypto
+      .createHmac("sha512", secret)
+      .update(rawBody)
+      .digest("hex");
+
+    const receivedHash = req.headers["x-paystack-signature"];
+
+    if (computedHash !== receivedHash) {
+      console.warn("⚠️ Invalid Paystack signature");
       return res.status(400).send("Invalid signature");
     }
 
-    const event = JSON.parse(req.body.toString());
-    const ev = event.event;
-    const data = event.data;
+    const event = JSON.parse(rawBody.toString());
+    console.log("📩 Paystack event:", event.event);
 
-    if (ev === "charge.success") {
-      const email = data.customer?.email?.toLowerCase?.() || null;
-      const phone = data.customer?.phone || null;
-      const amount = (data.amount || 0) / 100; // kobo -> naira
+    if (event.event === "charge.success") {
+      const data = event.data;
       const reference = data.reference;
+      const amount = data.amount / 100; // kobo → naira
+      const email = data.customer.email;
 
-      console.log(`💰 Paystack: charge.success from ${email || phone} amount ₦${amount}`);
+      console.log(`💰 Payment from ${email}: ₦${amount}`);
 
-      // log transaction (always)
-      await db.collection("transactions").doc(reference).set({
-        email: email || null,
-        phone: phone || null,
-        reference,
-        amount,
-        status: "success",
-        raw: data,
-        timestamp: new Date().toISOString(),
-      });
+      const usersRef = db.collection("users");
+      const snapshot = await usersRef.where("email", "==", email).limit(1).get();
 
-      // find user
-      let userDoc = null;
-      if (email) userDoc = await findUserDocByIdentifier(email);
-      if (!userDoc && phone) userDoc = await findUserDocByIdentifier(phone);
+      if (snapshot.empty) {
+        console.warn("⚠️ No user found for:", email);
+      } else {
+        const userDoc = snapshot.docs[0];
+        const userRef = userDoc.ref;
 
-      if (!userDoc) {
-        console.warn("Payment received but no user found:", email || phone);
-        return res.status(200).send("Transaction recorded (no user)");
-      }
-
-      // plan mapping in naira -> MB, days
-      const plans = {
-        500: { name: "N500", dataLimitMB: 1024, days: 30 },    // 1 GB
-        1000: { name: "N1000", dataLimitMB: 3072, days: 30 },  // 3 GB
-        2000: { name: "N2000", dataLimitMB: 8192, days: 30 },  // 8 GB
-        5000: { name: "N5000", dataLimitMB: 20480, days: 30 }, // 20 GB
-      };
-
-      const plan = plans[amount] || null;
-      const userRef = userDoc.ref;
-
-      await db.runTransaction(async (t) => {
-        const snap = await t.get(userRef);
-        if (!snap.exists) throw new Error("User disappeared during tx");
-        const u = snap.data();
-        const now = new Date();
-        const oldExpiry = u.expiryDate ? new Date(u.expiryDate) : null;
-
-        let expiryDate;
-        if (plan) {
-          expiryDate = oldExpiry && oldExpiry > now
-            ? new Date(oldExpiry.getTime() + plan.days * 86400000)
-            : new Date(now.getTime() + plan.days * 86400000);
-        }
-
-        const updates = {
-          balance: (u.balance || 0) + amount,
-          lastPayment: { reference, amount, date: now.toISOString() },
-          updatedAt: now.toISOString(),
+        const plans = {
+          500: { name: "1GB", dataLimit: 1 * 1024, days: 30 },
+          1000: { name: "3GB", dataLimit: 3 * 1024, days: 30 },
+          2000: { name: "8GB", dataLimit: 8 * 1024, days: 30 },
+          5000: { name: "20GB", dataLimit: 20 * 1024, days: 30 },
         };
 
-        if (plan) {
-          updates.currentPlan = plan.name;
-          updates.planLimit = (u.planLimit || 0) + plan.dataLimitMB;
-          updates.dataUsed = 0;
-          updates.expiryDate = expiryDate.toISOString();
-          updates.vpnActive = true;
-        }
+        const plan = plans[amount];
 
-        t.update(userRef, updates);
-      });
+        await db.runTransaction(async (t) => {
+          const doc = await t.get(userRef);
+          if (!doc.exists) throw new Error("User not found");
 
-      console.log(`✅ Applied payment for user, plan: ${plan?.name || "balance-only"}`);
-      return res.status(200).send("OK");
+          const user = doc.data();
+          let updates = {
+            balance: (user.balance || 0) + amount,
+            lastPayment: {
+              reference,
+              amount,
+              date: new Date().toISOString(),
+            },
+          };
+
+          if (plan) {
+            const expiryDate = new Date();
+            expiryDate.setDate(expiryDate.getDate() + plan.days);
+
+            updates = {
+              ...updates,
+              currentPlan: plan.name,
+              planLimit: plan.dataLimit,
+              dataUsed: 0,
+              expiryDate: expiryDate.toISOString(),
+              vpnActive: true,
+            };
+
+            console.log(`✅ Assigned plan ${plan.name} to ${email}`);
+          } else {
+            console.log(`✅ Balance only updated for ${email}`);
+          }
+
+          t.update(userRef, updates);
+          const txRef = db.collection("transactions").doc(reference);
+          t.set(txRef, {
+            uid: userDoc.id,
+            email,
+            reference,
+            amount,
+            status: "success",
+            plan: plan ? plan.name : null,
+            timestamp: new Date().toISOString(),
+          });
+        });
+      }
     }
 
-    res.status(200).send("Ignored event");
-  } catch (err) {
-    console.error("Webhook processing error:", err);
-    res.status(500).send("Server error");
+    res.sendStatus(200);
+  } catch (error) {
+    console.error("❌ Webhook error:", error.message);
+    res.sendStatus(500);
   }
 });
+
 
 // ---- VPN SESSION CONNECT ----
 app.post("/vpn/session/connect", async (req, res) => {
