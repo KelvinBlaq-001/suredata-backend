@@ -74,110 +74,119 @@ app.get("/admin/summary", async (req, res) => {
   }
 });
 
-// ---------------------------- 
-// PAYSTACK WEBHOOK (FIXED VERSION)
 // ----------------------------
+// PAYSTACK WEBHOOK (FINAL FIXED VERSION)
+// ----------------------------
+import bodyParser from "body-parser";
 
-// We handle Paystack webhooks separately with raw body parser
-app.post("/api/paystack/webhook", express.raw({ type: "application/json" }), async (req, res) => {
-  try {
-    const secret = process.env.PAYSTACK_SECRET_KEY;
-    const rawBody = req.body; // already a Buffer from express.raw()
+// Use bodyParser.raw ONLY for this route
+app.post(
+  "/api/paystack/webhook",
+  bodyParser.raw({ type: "application/json" }),
+  async (req, res) => {
+    try {
+      const secret = process.env.PAYSTACK_SECRET_KEY;
+      const rawBody = req.body; // still a Buffer
+      const signature = req.headers["x-paystack-signature"];
 
-    const computedHash = crypto
-      .createHmac("sha512", secret)
-      .update(rawBody)
-      .digest("hex");
+      // ✅ Verify signature using the raw buffer
+      const computedHash = crypto
+        .createHmac("sha512", secret)
+        .update(rawBody)
+        .digest("hex");
 
-    const receivedHash = req.headers["x-paystack-signature"];
+      if (computedHash !== signature) {
+        console.warn("⚠️ Invalid Paystack signature");
+        return res.status(400).send("Invalid signature");
+      }
 
-    if (computedHash !== receivedHash) {
-      console.warn("⚠️ Invalid Paystack signature");
-      return res.status(400).send("Invalid signature");
-    }
+      // Parse the raw buffer AFTER verifying the hash
+      const event = JSON.parse(rawBody.toString());
+      console.log("📩 Paystack event:", event.event);
 
-    const event = JSON.parse(rawBody.toString());
-    console.log("📩 Paystack event:", event.event);
+      if (event.event === "charge.success") {
+        const data = event.data;
+        const reference = data.reference;
+        const amount = data.amount / 100;
+        const email = data.customer.email;
 
-    if (event.event === "charge.success") {
-      const data = event.data;
-      const reference = data.reference;
-      const amount = data.amount / 100; // kobo → naira
-      const email = data.customer.email;
+        console.log(`💰 Payment from ${email}: ₦${amount}`);
 
-      console.log(`💰 Payment from ${email}: ₦${amount}`);
+        // --- Firestore logic ---
+        const usersRef = db.collection("users");
+        const snapshot = await usersRef.where("email", "==", email).limit(1).get();
 
-      const usersRef = db.collection("users");
-      const snapshot = await usersRef.where("email", "==", email).limit(1).get();
+        if (snapshot.empty) {
+          console.warn("⚠️ No user found for:", email);
+        } else {
+          const userDoc = snapshot.docs[0];
+          const userRef = userDoc.ref;
 
-      if (snapshot.empty) {
-        console.warn("⚠️ No user found for:", email);
-      } else {
-        const userDoc = snapshot.docs[0];
-        const userRef = userDoc.ref;
-
-        const plans = {
-          500: { name: "1GB", dataLimit: 1 * 1024, days: 30 },
-          1000: { name: "3GB", dataLimit: 3 * 1024, days: 30 },
-          2000: { name: "8GB", dataLimit: 8 * 1024, days: 30 },
-          5000: { name: "20GB", dataLimit: 20 * 1024, days: 30 },
-        };
-
-        const plan = plans[amount];
-
-        await db.runTransaction(async (t) => {
-          const doc = await t.get(userRef);
-          if (!doc.exists) throw new Error("User not found");
-
-          const user = doc.data();
-          let updates = {
-            balance: (user.balance || 0) + amount,
-            lastPayment: {
-              reference,
-              amount,
-              date: new Date().toISOString(),
-            },
+          const plans = {
+            500: { name: "1GB", dataLimit: 1 * 1024, days: 30 },
+            1000: { name: "3GB", dataLimit: 3 * 1024, days: 30 },
+            2000: { name: "8GB", dataLimit: 8 * 1024, days: 30 },
+            5000: { name: "20GB", dataLimit: 20 * 1024, days: 30 },
           };
 
-          if (plan) {
-            const expiryDate = new Date();
-            expiryDate.setDate(expiryDate.getDate() + plan.days);
+          const plan = plans[amount];
 
-            updates = {
-              ...updates,
-              currentPlan: plan.name,
-              planLimit: plan.dataLimit,
-              dataUsed: 0,
-              expiryDate: expiryDate.toISOString(),
-              vpnActive: true,
+          await db.runTransaction(async (t) => {
+            const doc = await t.get(userRef);
+            if (!doc.exists) throw new Error("User not found");
+
+            const user = doc.data();
+
+            let updates = {
+              balance: (user.balance || 0) + amount,
+              lastPayment: {
+                reference,
+                amount,
+                date: new Date().toISOString(),
+              },
             };
 
-            console.log(`✅ Assigned plan ${plan.name} to ${email}`);
-          } else {
-            console.log(`✅ Balance only updated for ${email}`);
-          }
+            if (plan) {
+              const expiryDate = new Date();
+              expiryDate.setDate(expiryDate.getDate() + plan.days);
 
-          t.update(userRef, updates);
-          const txRef = db.collection("transactions").doc(reference);
-          t.set(txRef, {
-            uid: userDoc.id,
-            email,
-            reference,
-            amount,
-            status: "success",
-            plan: plan ? plan.name : null,
-            timestamp: new Date().toISOString(),
+              updates = {
+                ...updates,
+                currentPlan: plan.name,
+                planLimit: plan.dataLimit,
+                dataUsed: 0,
+                expiryDate: expiryDate.toISOString(),
+                vpnActive: true,
+              };
+
+              console.log(`✅ Assigned plan ${plan.name} to ${email}`);
+            } else {
+              console.log(`✅ Balance only updated for ${email}`);
+            }
+
+            t.update(userRef, updates);
+
+            const txRef = db.collection("transactions").doc(reference);
+            t.set(txRef, {
+              uid: userDoc.id,
+              email,
+              reference,
+              amount,
+              status: "success",
+              plan: plan ? plan.name : null,
+              timestamp: new Date().toISOString(),
+            });
           });
-        });
+        }
       }
-    }
 
-    res.sendStatus(200);
-  } catch (error) {
-    console.error("❌ Webhook error:", error.message);
-    res.sendStatus(500);
+      res.sendStatus(200);
+    } catch (error) {
+      console.error("❌ Webhook error:", error);
+      res.sendStatus(500);
+    }
   }
-});
+);
 
 
 // ---- VPN SESSION CONNECT ----
