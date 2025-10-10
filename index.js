@@ -191,6 +191,8 @@ app.post(
   }
 );
 
+// ✅ Re-enable JSON parsing for all other routes
+app.use(express.json());
 
 // ---- VPN SESSION CONNECT ----
 app.post("/vpn/session/connect", async (req, res) => {
