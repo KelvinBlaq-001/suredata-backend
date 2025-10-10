@@ -231,39 +231,53 @@ app.post("/vpn/session/connect", async (req, res) => {
 // ---- VPN SESSION DISCONNECT ----
 app.post("/vpn/session/disconnect", async (req, res) => {
   try {
-    const { username, bytes_sent = 0, bytes_received = 0, dataUsedMB } = req.body;
-    if (!username) return res.status(400).send("Missing username");
+    const { username, vpn_ip, data_used_mb = 0 } = req.body;
+    console.log("🔴 VPN Disconnect triggered for:", username, vpn_ip, "Data used:", data_used_mb, "MB");
 
-    const userDoc = await findUserDocByIdentifier(username);
-    if (!userDoc) return res.status(404).send("User not found");
+    const usersRef = db.collection("users");
+    const snapshot = await usersRef.where("email", "==", username).limit(1).get();
 
-    const uSnap = await userDoc.ref.get();
-    const u = uSnap.data();
+    if (snapshot.empty) {
+      console.log("⚠️ No user found for:", username);
+      return res.status(404).json({ error: "User not found" });
+    }
 
-    // prefer explicit dataUsedMB if provided
-    let usedMB = typeof dataUsedMB === "number" ? dataUsedMB : (Number(bytes_sent || 0) + Number(bytes_received || 0)) / (1024 * 1024);
-    usedMB = Number(usedMB || 0);
+    const userDoc = snapshot.docs[0];
+    const userRef = userDoc.ref;
+    const user = userDoc.data();
 
-    const newDataUsed = (u.dataUsed || 0) + usedMB;
-    const planLimit = u.planLimit || 0;
-    const expired = u.expiryDate && new Date(u.expiryDate) < new Date();
-    const exhausted = planLimit > 0 && newDataUsed >= planLimit;
-    const stillActive = !expired && !exhausted;
+    const updatedDataUsed = (user.dataUsed || 0) + data_used_mb;
+    let vpnActive = false;
+    let expired = false;
 
-    await userDoc.ref.update({
-      dataUsed: newDataUsed,
-      vpnActive: stillActive,
+    // Check if user exceeded data limit
+    if (updatedDataUsed >= (user.planLimit || Infinity)) {
+      vpnActive = false;
+      expired = true;
+      console.log(`⚠️ ${username} has exhausted their data plan.`);
+    }
+
+    const updates = {
+      dataUsed: updatedDataUsed,
+      vpnActive,
       lastDisconnect: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    });
+    };
 
-    console.log(`📡 Disconnected: ${username} used ${usedMB.toFixed(2)}MB (total ${newDataUsed.toFixed(2)}MB). Active: ${stillActive}`);
-    res.status(200).json({ success: true, dataUsedMB: usedMB, totalDataUsedMB: newDataUsed });
-  } catch (err) {
-    console.error("Disconnect error:", err);
-    res.status(500).json({ error: err.message });
+    await userRef.update(updates);
+    console.log(`✅ Updated user ${username} as disconnected. Total used: ${updatedDataUsed}MB`);
+
+    res.json({
+      success: true,
+      username,
+      dataUsed: updatedDataUsed,
+      expired,
+    });
+  } catch (error) {
+    console.error("❌ Disconnect error:", error.message);
+    res.status(500).json({ error: error.message });
   }
 });
+
 
 // ---- AUTO EXPIRE CHECK (POST or GET accepted) ----
 app.all("/cron/expire-check", async (req, res) => {
