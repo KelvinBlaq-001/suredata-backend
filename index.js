@@ -82,9 +82,8 @@ app.get("/admin/summary", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
-
-// ----------------------------
-// PAYSTACK WEBHOOK + ROLLOVER LOGIC
+// ---------------------------- 
+// PAYSTACK WEBHOOK (with rollover + stacking)
 // ----------------------------
 app.post(
   "/payments/webhook",
@@ -92,7 +91,6 @@ app.post(
   async (req, res) => {
     try {
       const secret = process.env.PAYSTACK_SECRET_KEY;
-
       const rawBody = Buffer.isBuffer(req.body)
         ? req.body
         : Buffer.from(JSON.stringify(req.body));
@@ -114,96 +112,84 @@ app.post(
       if (event.event === "charge.success") {
         const data = event.data;
         const reference = data.reference;
-        const amount = data.amount / 100;
-        const email = data.customer.email;
+        const amount = data.amount / 100; // in NGN
+        const email = data.customer.email.toLowerCase();
 
         console.log(`💰 Payment from ${email}: ₦${amount}`);
 
-        const usersRef = db.collection("users");
-        const snapshot = await usersRef
-          .where("email", "==", email)
-          .limit(1)
-          .get();
+        const plans = {
+          500: { name: "1GB", dataLimit: 1 * 1024, days: 30 },
+          1000: { name: "3GB", dataLimit: 3 * 1024, days: 30 },
+          2000: { name: "8GB", dataLimit: 8 * 1024, days: 30 },
+          5000: { name: "20GB", dataLimit: 20 * 1024, days: 30 },
+        };
 
-        if (snapshot.empty) {
+        const plan = plans[amount];
+        if (!plan) {
+          console.warn(`⚠️ Unknown plan for amount ₦${amount}`);
+          return res.sendStatus(200);
+        }
+
+        const userSnap = await db.collection("users").where("email", "==", email).limit(1).get();
+        if (userSnap.empty) {
           console.warn("⚠️ No user found for:", email);
-        } else {
-          const userDoc = snapshot.docs[0];
-          const userRef = userDoc.ref;
+          return res.sendStatus(200);
+        }
 
-          const plans = {
-            500: { name: "1GB", dataLimit: 1 * 1024, days: 30 },
-            1000: { name: "3GB", dataLimit: 3 * 1024, days: 30 },
-            2000: { name: "8GB", dataLimit: 8 * 1024, days: 30 },
-            5000: { name: "20GB", dataLimit: 20 * 1024, days: 30 },
-          };
+        const userDoc = userSnap.docs[0];
+        const userRef = userDoc.ref;
+        const user = userDoc.data();
 
-          const plan = plans[amount];
+        await db.runTransaction(async (t) => {
+          const doc = await t.get(userRef);
+          if (!doc.exists) throw new Error("User not found in transaction");
 
-          await db.runTransaction(async (t) => {
-            const doc = await t.get(userRef);
-            if (!doc.exists) throw new Error("User not found");
+          const u = doc.data();
+          const now = new Date();
+          const expiry = u.expiryDate ? new Date(u.expiryDate) : null;
+          const isExpired = !expiry || expiry < now;
+          const remainingData = Math.max((u.planLimit || 0) - (u.dataUsed || 0), 0);
 
-            const user = doc.data();
-            const now = new Date();
+          // 🔄 Apply rollover logic
+          let newPlanLimit = plan.dataLimit;
+          if (!isExpired && remainingData > 0) {
+            newPlanLimit += remainingData;
+            console.log(`🔁 Rollover applied: added ${remainingData}MB from previous plan.`);
+          }
 
-            let updates = {
-              balance: (user.balance || 0) + amount,
-              lastPayment: {
-                reference,
-                amount,
-                date: now.toISOString(),
-              },
-            };
+          const newExpiry = new Date();
+          newExpiry.setDate(newExpiry.getDate() + plan.days);
 
-            if (plan) {
-              const expiryDate = new Date();
-              expiryDate.setDate(expiryDate.getDate() + plan.days);
-
-              // ROLLOVER logic
-              let remainingData = 0;
-              const oldExpiry = user.expiryDate
-                ? new Date(user.expiryDate)
-                : null;
-              const oldActive = oldExpiry && oldExpiry > now;
-
-              if (oldActive) {
-                remainingData = Math.max(
-                  (user.planLimit || 0) - (user.dataUsed || 0),
-                  0
-                );
-              }
-
-              const totalData = (plan.dataLimit || 0) + remainingData;
-
-              updates = {
-                ...updates,
-                currentPlan: plan.name,
-                planLimit: totalData,
-                dataUsed: 0,
-                expiryDate: expiryDate.toISOString(),
-                vpnActive: true,
-              };
-
-              console.log(
-                `✅ Assigned plan ${plan.name} (${totalData}MB total) to ${email}`
-              );
-            }
-
-            t.update(userRef, updates);
-
-            const txRef = db.collection("transactions").doc(reference);
-            t.set(txRef, {
-              uid: userDoc.id,
-              email,
+          const updates = {
+            balance: (u.balance || 0) + amount,
+            currentPlan: plan.name,
+            planLimit: newPlanLimit,
+            dataUsed: 0,
+            expiryDate: newExpiry.toISOString(),
+            vpnActive: true,
+            lastPayment: {
               reference,
               amount,
-              status: "success",
-              plan: plan ? plan.name : null,
-              timestamp: now.toISOString(),
-            });
+              date: now.toISOString(),
+            },
+          };
+
+          t.update(userRef, updates);
+
+          const txRef = db.collection("transactions").doc(reference);
+          t.set(txRef, {
+            uid: userDoc.id,
+            email,
+            reference,
+            amount,
+            plan: plan.name,
+            status: "success",
+            rolloverApplied: !isExpired && remainingData > 0,
+            timestamp: now.toISOString(),
           });
-        }
+        });
+
+        console.log(`✅ ${email} purchased ${plan.name} (${plan.dataLimit}MB).`);
       }
 
       res.sendStatus(200);
@@ -213,6 +199,7 @@ app.post(
     }
   }
 );
+
 
 // ✅ Re-enable JSON parsing for other routes
 app.use(express.json());
