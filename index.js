@@ -397,18 +397,84 @@ app.all("/cron/expire-check", async (req, res) => {
   }
 });
 
-// ---- TAILSCALE SYNC (stub / full sync later) ----
-app.all("/cron/tailscale-sync", async (req, res) => {
+// ---- TAILSCALE SYNC ----
+app.get("/cron/tailscale-sync", async (req, res) => {
   try {
-    console.log("🔄 Running Tailscale sync (stub)...");
-    // Full implementation: fetch devices from Tailscale API and attempt disable for users flagged inactive
-    // (Implemented earlier in our conversation; plug it in later)
-    return res.status(200).send("✅ Tailscale sync executed (stub)");
+    const tailnet = process.env.TAILSCALE_TAILNET;
+    const apiKey = process.env.TAILSCALE_API_KEY;
+
+    if (!tailnet || !apiKey) {
+      console.warn("⚠️ Missing TAILSCALE_API_KEY or TAILSCALE_TAILNET");
+      return res.status(500).send("Tailscale config missing");
+    }
+
+    console.log("🔄 Fetching Tailscale devices...");
+    const response = await fetch(
+      `https://api.tailscale.com/api/v2/tailnet/${encodeURIComponent(tailnet)}/devices`,
+      {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+        },
+      }
+    );
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Tailscale API error ${response.status}: ${text}`);
+    }
+
+    const data = await response.json();
+    const devices = data.devices || [];
+    console.log(`📡 Found ${devices.length} Tailscale devices`);
+
+    const usersSnap = await db.collection("users").get();
+    const now = new Date();
+    let checked = 0,
+      disabled = 0;
+
+    for (const doc of usersSnap.docs) {
+      const u = doc.data();
+      const expired = u.expiryDate && new Date(u.expiryDate) < now;
+      const exhausted =
+        (u.planLimit || 0) > 0 && (u.dataUsed || 0) >= u.planLimit;
+
+      if (expired || exhausted) {
+        // Match device by user email or hostname
+        const match = devices.find(
+          (d) =>
+            d.user?.toLowerCase().includes((u.email || "").toLowerCase()) ||
+            d.hostname
+              ?.toLowerCase()
+              .includes((u.email || "").split("@")[0].toLowerCase())
+        );
+
+        if (match) {
+          console.log(`🛑 Disabling device ${match.hostname} for ${u.email}`);
+          await fetch(
+            `https://api.tailscale.com/api/v2/device/${match.id}/disable`,
+            {
+              method: "POST",
+              headers: { Authorization: `Bearer ${apiKey}` },
+            }
+          );
+          disabled++;
+        }
+
+        await doc.ref.update({ vpnActive: false });
+      }
+
+      checked++;
+    }
+
+    const msg = `✅ Tailscale sync complete: ${checked} users checked, ${disabled} devices disabled`;
+    console.log(msg);
+    res.status(200).send(msg);
   } catch (err) {
-    console.error("❌ tailscale-sync error:", err);
-    return res.status(500).send("Tailscale sync failed");
+    console.error("❌ Tailscale sync error:", err);
+    res.status(500).send(err.message);
   }
 });
+
 
 // ---- Admin/manual endpoint: Trigger remote VPN disable (for testing) ----
 app.post("/vpn/disable", async (req, res) => {
