@@ -231,6 +231,32 @@ app.post(
 // ✅ Re-enable JSON parsing for other routes
 app.use(express.json());
 
+// ---- Helper: Disable VPN Access ----
+async function disableVPNAccess(username) {
+  try {
+    const vpnAPI = process.env.VPN_DISABLE_ENDPOINT; // e.g. "http://127.0.0.1:8081/vpn/disable"
+    if (!vpnAPI) {
+      console.warn("⚠️ No VPN_DISABLE_ENDPOINT set in .env");
+      return;
+    }
+
+    const res = await fetch(vpnAPI, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username }),
+    });
+
+    if (!res.ok) {
+      console.warn(`⚠️ Failed to disable VPN for ${username} (${res.status})`);
+    } else {
+      console.log(`🛑 VPN access disabled for ${username}`);
+    }
+  } catch (err) {
+    console.error("❌ disableVPNAccess error:", err.message);
+  }
+}
+
+
 // ---- VPN SESSION CONNECT ----
 app.post("/vpn/session/connect", async (req, res) => {
   try {
@@ -307,7 +333,8 @@ app.post("/vpn/session/disconnect", async (req, res) => {
     // Auto-disable in Tailscale if needed
     if (overLimit || expired) {
       console.log(`⚠️ Auto-disabling VPN for ${username}`);
-      // you can call your tailscale API disable helper here
+}
+
     }
 
     res.json({
@@ -355,7 +382,9 @@ app.post("/vpn/session/update-usage", async (req, res) => {
 
     if (overLimit || expired) {
       console.log(`⚠️ Auto-disabling VPN for ${username}`);
-      // Optional: disable via Tailscale
+      await doc.ref.update({ vpnActive: false });
+await disableVPNAccess(u.email || u.username || doc.id);
+
     }
 
     res.json({
@@ -387,6 +416,7 @@ app.all("/cron/expire-check", async (req, res) => {
 
       if (expired || exhausted) {
         await doc.ref.update({ vpnActive: false });
+        await disableVPNAccess(u.email || u.username || doc.id);
         count++;
       }
     }
@@ -397,6 +427,19 @@ app.all("/cron/expire-check", async (req, res) => {
     res.status(500).send("Cron error");
   }
 });
+
+// ---- TAILSCALE SYNC CRON (Optional future use) ----
+app.all("/cron/tailscale-sync", async (req, res) => {
+  try {
+    console.log("🔄 Running Tailscale sync (placeholder)...");
+    // You can later fetch your Tailscale devices and sync statuses here
+    res.status(200).send("✅ Tailscale sync executed (stub)");
+  } catch (err) {
+    console.error("❌ tailscale-sync error:", err.message);
+    res.status(500).send("Error syncing with Tailscale");
+  }
+});
+
 
 // ---- Start server ----
 const PORT = process.env.PORT || 8080;
