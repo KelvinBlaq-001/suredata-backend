@@ -82,8 +82,9 @@ app.get("/admin/summary", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 // ---------------------------- 
-// PAYSTACK WEBHOOK (with rollover + stacking)
+// PAYSTACK WEBHOOK (with rollover logic)
 // ----------------------------
 app.post(
   "/payments/webhook",
@@ -91,10 +92,12 @@ app.post(
   async (req, res) => {
     try {
       const secret = process.env.PAYSTACK_SECRET_KEY;
+
       const rawBody = Buffer.isBuffer(req.body)
         ? req.body
         : Buffer.from(JSON.stringify(req.body));
 
+      // Verify signature
       const computedHash = crypto
         .createHmac("sha512", secret)
         .update(rawBody)
@@ -112,11 +115,25 @@ app.post(
       if (event.event === "charge.success") {
         const data = event.data;
         const reference = data.reference;
-        const amount = data.amount / 100; // in NGN
-        const email = data.customer.email.toLowerCase();
+        const amount = data.amount / 100;
+        const email = data.customer.email;
 
         console.log(`💰 Payment from ${email}: ₦${amount}`);
 
+        // Firestore: Find user
+        const usersRef = db.collection("users");
+        const snapshot = await usersRef.where("email", "==", email).limit(1).get();
+
+        if (snapshot.empty) {
+          console.warn("⚠️ No user found for:", email);
+          return res.sendStatus(200);
+        }
+
+        const userDoc = snapshot.docs[0];
+        const userRef = userDoc.ref;
+        const user = userDoc.data();
+
+        // Available plans
         const plans = {
           500: { name: "1GB", dataLimit: 1 * 1024, days: 30 },
           1000: { name: "3GB", dataLimit: 3 * 1024, days: 30 },
@@ -126,70 +143,80 @@ app.post(
 
         const plan = plans[amount];
         if (!plan) {
-          console.warn(`⚠️ Unknown plan for amount ₦${amount}`);
+          console.warn(`⚠️ Unknown plan amount: ₦${amount}`);
           return res.sendStatus(200);
         }
 
-        const userSnap = await db.collection("users").where("email", "==", email).limit(1).get();
-        if (userSnap.empty) {
-          console.warn("⚠️ No user found for:", email);
-          return res.sendStatus(200);
-        }
-
-        const userDoc = userSnap.docs[0];
-        const userRef = userDoc.ref;
-        const user = userDoc.data();
-
+        // Start transaction
         await db.runTransaction(async (t) => {
           const doc = await t.get(userRef);
-          if (!doc.exists) throw new Error("User not found in transaction");
-
           const u = doc.data();
-          const now = new Date();
-          const expiry = u.expiryDate ? new Date(u.expiryDate) : null;
-          const isExpired = !expiry || expiry < now;
-          const remainingData = Math.max((u.planLimit || 0) - (u.dataUsed || 0), 0);
 
-          // 🔄 Apply rollover logic
-          let newPlanLimit = plan.dataLimit;
-          if (!isExpired && remainingData > 0) {
-            newPlanLimit += remainingData;
-            console.log(`🔁 Rollover applied: added ${remainingData}MB from previous plan.`);
-          }
+          let currentDataUsed = u.dataUsed || 0;
+          let currentPlanLimit = u.planLimit || 0;
+          let currentExpiry = u.expiryDate ? new Date(u.expiryDate) : null;
+          let now = new Date();
 
+          // ✅ Check if current plan still active (not expired)
+          const isPlanActive = currentExpiry && currentExpiry > now;
+
+          // ✅ New plan expiry
           const newExpiry = new Date();
           newExpiry.setDate(newExpiry.getDate() + plan.days);
 
+          let finalPlanLimit, finalExpiry;
+
+          if (isPlanActive) {
+            // Plan still active → rollover
+            const remainingData = Math.max(currentPlanLimit - currentDataUsed, 0);
+            finalPlanLimit = remainingData + plan.dataLimit;
+
+            // Option A: Keep old expiry if it's later
+            // Option B (Rollover): Extend expiry to new plan date
+            finalExpiry = newExpiry > currentExpiry ? newExpiry : currentExpiry;
+
+            console.log(`🔄 Rollover applied for ${email}: ${remainingData}MB + ${plan.dataLimit}MB`);
+          } else {
+            // Old plan expired → reset everything
+            finalPlanLimit = plan.dataLimit;
+            finalExpiry = newExpiry;
+
+            console.log(`🆕 New plan started for ${email}: ${plan.dataLimit}MB`);
+          }
+
+          // Update user
           const updates = {
             balance: (u.balance || 0) + amount,
             currentPlan: plan.name,
-            planLimit: newPlanLimit,
+            planLimit: finalPlanLimit,
             dataUsed: 0,
-            expiryDate: newExpiry.toISOString(),
+            expiryDate: finalExpiry.toISOString(),
             vpnActive: true,
             lastPayment: {
               reference,
               amount,
-              date: now.toISOString(),
+              date: new Date().toISOString(),
             },
           };
 
           t.update(userRef, updates);
 
+          // Log transaction
           const txRef = db.collection("transactions").doc(reference);
           t.set(txRef, {
             uid: userDoc.id,
             email,
             reference,
             amount,
-            plan: plan.name,
             status: "success",
-            rolloverApplied: !isExpired && remainingData > 0,
-            timestamp: now.toISOString(),
+            plan: plan.name,
+            dataAdded: plan.dataLimit,
+            totalLimit: finalPlanLimit,
+            timestamp: new Date().toISOString(),
           });
         });
 
-        console.log(`✅ ${email} purchased ${plan.name} (${plan.dataLimit}MB).`);
+        console.log(`✅ ${email} purchased ${plan.name} (${plan.dataLimit}MB)`);
       }
 
       res.sendStatus(200);
