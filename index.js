@@ -37,6 +37,28 @@ if (!admin.apps.length) {
 }
 const db = admin.firestore();
 
+// --- Notification Helper ---
+async function sendUserNotification(email, type, message) {
+  try {
+    console.log(`🔔 Notification [${type}] → ${email}: ${message}`);
+    // save to Firestore
+    const notif = {
+      email,
+      type,
+      message,
+      timestamp: new Date().toISOString(),
+      read: false,
+    };
+    await db.collection("notifications").add(notif);
+
+    // optional: send email or push notification (hook later)
+    // await sendEmail(email, "SureData Update", message);
+  } catch (err) {
+    console.error("Notification error:", err.message);
+  }
+}
+
+
 // --------------------------
 // Helper: Disable VPN Access (global, reusable)
 // --------------------------
@@ -211,6 +233,12 @@ app.post(
 
         console.log(`✅ ${email} purchased ${plan.name} (${plan.dataLimit}MB)`);
       }
+await sendUserNotification(
+  email,
+  "plan_activated",
+  `Your ${plan.name} plan (${plan.dataLimit / 1024}GB) has been activated. Enjoy secure browsing!`
+);
+
 
       return res.sendStatus(200);
     } catch (err) {
@@ -325,6 +353,13 @@ app.post("/vpn/session/disconnect", async (req, res) => {
       console.log(`⚠️ Auto-disabling VPN for ${username}`);
       await disableVPNAccess(username);
     }
+await sendUserNotification(
+  username,
+  "plan_exhausted",
+  expired
+    ? `Your data plan has expired. Please renew to restore access.`
+    : `Your data limit has been exhausted. Please purchase a new plan.`
+);
 
     res.json({ success: true, username, dataUsed: updatedDataUsed, overLimit, expired });
   } catch (error) {
@@ -346,6 +381,15 @@ app.post("/vpn/session/update-usage", async (req, res) => {
     const user = userDoc.data();
 
     const newDataUsed = (user.dataUsed || 0) + usage_mb;
+    const usagePercent = (newDataUsed / (user.planLimit || 1)) * 100;
+if (usagePercent >= 90 && usagePercent < 100) {
+  await sendUserNotification(
+    username,
+    "plan_near_limit",
+    `Heads up! You've used ${usagePercent.toFixed(0)}% of your data plan.`
+  );
+}
+
     const overLimit = newDataUsed >= (user.planLimit || Infinity);
     const expired = user.expiryDate && new Date(user.expiryDate) < new Date();
 
@@ -389,6 +433,12 @@ app.all("/cron/expire-check", async (req, res) => {
         count++;
       }
     }
+await sendUserNotification(
+  u.email,
+  "plan_expired",
+  `Your plan has expired. Renew to reactivate your VPN.`
+);
+
 
     res.status(200).send(`✅ Processed ${usersSnap.size} users, disabled ${count}`);
   } catch (err) {
