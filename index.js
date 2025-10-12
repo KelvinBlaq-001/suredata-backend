@@ -295,13 +295,56 @@ app.get("/admin/summary", async (req, res) => {
   }
 });
 
+// ✅ Re-enable JSON parsing for other routes
+app.use(express.json());
+
+// ---- Helper: Disable VPN Access ----
+async function disableVPNAccess(username) {
+  try {
+    const vpnAPI = process.env.VPN_DISABLE_ENDPOINT; // e.g. "http://127.0.0.1:8081/vpn/disable"
+    if (!vpnAPI) {
+      console.warn("⚠️ No VPN_DISABLE_ENDPOINT set in .env - skipping actual disable call");
+      return;
+    }
+
+    const res = await fetch(vpnAPI, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username }),
+    });
+
+    if (!res.ok) {
+      console.warn(`⚠️ Failed to disable VPN for ${username} (${res.status})`);
+    } else {
+      console.log(`🛑 VPN access disabled for ${username}`);
+    }
+  } catch (err) {
+    console.error("❌ disableVPNAccess error:", err.message);
+  }
+}
+
+// ---- Helper: Notify User ----
+async function notifyUser(email, message) {
+  try {
+    // 🔔 Placeholder for FCM or email later
+    console.log(`🔔 Notification for ${email}: ${message}`);
+  } catch (err) {
+    console.error("Notification error:", err.message);
+  }
+}
+
 // ---- VPN SESSION CONNECT ----
 app.post("/vpn/session/connect", async (req, res) => {
   try {
     const { username, vpn_ip } = req.body;
     console.log("🟢 VPN Connect triggered for:", username, vpn_ip);
 
-    const snapshot = await db.collection("users").where("email", "==", username).limit(1).get();
+    const snapshot = await db
+      .collection("users")
+      .where("email", "==", username)
+      .limit(1)
+      .get();
+
     if (snapshot.empty) {
       console.log("⚠️ No user found for:", username);
       return res.status(404).json({ error: "User not found" });
@@ -326,42 +369,61 @@ app.post("/vpn/session/connect", async (req, res) => {
 app.post("/vpn/session/disconnect", async (req, res) => {
   try {
     const { username, vpn_ip, data_used_mb = 0 } = req.body;
-    console.log("🔴 VPN Disconnect triggered for:", username, vpn_ip, "Data used:", data_used_mb, "MB");
+    console.log(
+      "🔴 VPN Disconnect triggered for:",
+      username,
+      vpn_ip,
+      "Data used:",
+      data_used_mb,
+      "MB"
+    );
 
-    const snapshot = await db.collection("users").where("email", "==", username).limit(1).get();
-    if (snapshot.empty) return res.status(404).json({ error: "User not found" });
+    const snapshot = await db
+      .collection("users")
+      .where("email", "==", username)
+      .limit(1)
+      .get();
+
+    if (snapshot.empty)
+      return res.status(404).json({ error: "User not found" });
 
     const userDoc = snapshot.docs[0];
     const user = userDoc.data();
 
     const updatedDataUsed = (user.dataUsed || 0) + data_used_mb;
     const overLimit = updatedDataUsed >= (user.planLimit || Infinity);
-    const expired = user.expiryDate && new Date(user.expiryDate) < new Date();
+    const expired =
+      user.expiryDate && new Date(user.expiryDate) < new Date();
 
     const updates = {
       dataUsed: updatedDataUsed,
       vpnActive: !overLimit && !expired,
       lastDisconnect: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
     };
 
     await userDoc.ref.update(updates);
-    console.log(`✅ Updated user ${username} as disconnected. Total used: ${updatedDataUsed}MB`);
+    console.log(
+      `✅ Updated user ${username} as disconnected. Total used: ${updatedDataUsed}MB`
+    );
 
-    // Auto-disable in VPN provider (best-effort)
+    if (overLimit) {
+      await notifyUser(username, "🚫 Your data plan has been exhausted.");
+    } else if (expired) {
+      await notifyUser(username, "⌛ Your data plan has expired.");
+    }
+
     if (overLimit || expired) {
       console.log(`⚠️ Auto-disabling VPN for ${username}`);
       await disableVPNAccess(username);
     }
-await sendUserNotification(
-  username,
-  "plan_exhausted",
-  expired
-    ? `Your data plan has expired. Please renew to restore access.`
-    : `Your data limit has been exhausted. Please purchase a new plan.`
-);
 
-    res.json({ success: true, username, dataUsed: updatedDataUsed, overLimit, expired });
+    res.json({
+      success: true,
+      username,
+      dataUsed: updatedDataUsed,
+      overLimit,
+      expired,
+    });
   } catch (error) {
     console.error("❌ Disconnect error:", error.message);
     res.status(500).json({ error: error.message });
@@ -374,24 +436,20 @@ app.post("/vpn/session/update-usage", async (req, res) => {
     const { username, usage_mb = 0 } = req.body;
     console.log(`📊 Updating usage for ${username}: +${usage_mb}MB`);
 
-    const snap = await db.collection("users").where("email", "==", username).limit(1).get();
+    const snap = await db
+      .collection("users")
+      .where("email", "==", username)
+      .limit(1)
+      .get();
     if (snap.empty) return res.status(404).json({ error: "User not found" });
 
     const userDoc = snap.docs[0];
     const user = userDoc.data();
 
     const newDataUsed = (user.dataUsed || 0) + usage_mb;
-    const usagePercent = (newDataUsed / (user.planLimit || 1)) * 100;
-if (usagePercent >= 90 && usagePercent < 100) {
-  await sendUserNotification(
-    username,
-    "plan_near_limit",
-    `Heads up! You've used ${usagePercent.toFixed(0)}% of your data plan.`
-  );
-}
-
     const overLimit = newDataUsed >= (user.planLimit || Infinity);
-    const expired = user.expiryDate && new Date(user.expiryDate) < new Date();
+    const expired =
+      user.expiryDate && new Date(user.expiryDate) < new Date();
 
     const updates = {
       dataUsed: newDataUsed,
@@ -402,12 +460,24 @@ if (usagePercent >= 90 && usagePercent < 100) {
     await userDoc.ref.update(updates);
     console.log(`✅ Updated usage for ${username}. Total: ${newDataUsed}MB`);
 
-    if (overLimit || expired) {
-      console.log(`⚠️ Auto-disabling VPN for ${username}`);
+    if (!overLimit && !expired) {
+      const percent = (newDataUsed / user.planLimit) * 100;
+      if (percent >= 90 && percent < 100) {
+        await notifyUser(username, "⚠️ Your data plan is almost finished (90% used).");
+      }
+    } else {
       await disableVPNAccess(username);
+      if (overLimit) await notifyUser(username, "🚫 Your data plan has been exhausted.");
+      if (expired) await notifyUser(username, "⌛ Your data plan has expired.");
     }
 
-    res.json({ success: true, username, dataUsed: newDataUsed, overLimit, expired });
+    res.json({
+      success: true,
+      username,
+      dataUsed: newDataUsed,
+      overLimit,
+      expired,
+    });
   } catch (err) {
     console.error("❌ Usage update error:", err.message);
     res.status(500).json({ error: err.message });
@@ -423,125 +493,73 @@ app.all("/cron/expire-check", async (req, res) => {
     let count = 0;
 
     for (const doc of usersSnap.docs) {
-      const u = doc.data();
-      const expired = u.expiryDate && new Date(u.expiryDate) < now;
-      const exhausted = (u.planLimit || 0) > 0 && (u.dataUsed || 0) >= u.planLimit;
+      const user = doc.data();
+      const expired = user.expiryDate && new Date(user.expiryDate) < now;
+      const exhausted =
+        (user.planLimit || 0) > 0 && (user.dataUsed || 0) >= user.planLimit;
 
       if (expired || exhausted) {
-        await doc.ref.update({ vpnActive: false, updatedAt: new Date().toISOString() });
-        await disableVPNAccess(u.email || u.username || doc.id);
+        await doc.ref.update({ vpnActive: false });
+        await disableVPNAccess(user.email || user.username || doc.id);
         count++;
       }
     }
-await sendUserNotification(
-  u.email,
-  "plan_expired",
-  `Your plan has expired. Renew to reactivate your VPN.`
-);
-
 
     res.status(200).send(`✅ Processed ${usersSnap.size} users, disabled ${count}`);
   } catch (err) {
     console.error("Expiry check error:", err);
-    res.status(500).send("Cron error");
+    res.status(500).send("Cron error: " + err.message);
   }
 });
 
 // ---- TAILSCALE SYNC ----
 app.get("/cron/tailscale-sync", async (req, res) => {
   try {
-    const tailnet = process.env.TAILSCALE_TAILNET;
+    console.log("🔄 Running Tailscale sync...");
     const apiKey = process.env.TAILSCALE_API_KEY;
+    if (!apiKey) return res.status(500).send("Missing TAILSCALE_API_KEY");
 
-    if (!tailnet || !apiKey) {
-      console.warn("⚠️ Missing TAILSCALE_API_KEY or TAILSCALE_TAILNET");
-      return res.status(500).send("Tailscale config missing");
-    }
+    // Fetch devices from Tailscale
+    const tailscaleRes = await fetch("https://api.tailscale.com/api/v2/tailnet/-/devices", {
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+      },
+    });
 
-    console.log("🔄 Fetching Tailscale devices...");
-    const response = await fetch(
-      `https://api.tailscale.com/api/v2/tailnet/${encodeURIComponent(tailnet)}/devices`,
-      {
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-        },
-      }
-    );
-
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Tailscale API error ${response.status}: ${text}`);
-    }
-
-    const data = await response.json();
+    const data = await tailscaleRes.json();
     const devices = data.devices || [];
-    console.log(`📡 Found ${devices.length} Tailscale devices`);
+    let matched = 0;
 
-    const usersSnap = await db.collection("users").get();
-    const now = new Date();
-    let checked = 0,
-      disabled = 0;
+    for (const d of devices) {
+      const email = d.user?.loginName || "";
+      if (!email) continue;
 
-    for (const doc of usersSnap.docs) {
-      const u = doc.data();
-      const expired = u.expiryDate && new Date(u.expiryDate) < now;
-      const exhausted =
-        (u.planLimit || 0) > 0 && (u.dataUsed || 0) >= u.planLimit;
+      const snap = await db
+        .collection("users")
+        .where("email", "==", email)
+        .limit(1)
+        .get();
 
-      if (expired || exhausted) {
-        // Match device by user email or hostname
-        const match = devices.find(
-          (d) =>
-            d.user?.toLowerCase().includes((u.email || "").toLowerCase()) ||
-            d.hostname
-              ?.toLowerCase()
-              .includes((u.email || "").split("@")[0].toLowerCase())
-        );
-
-        if (match) {
-          console.log(`🛑 Disabling device ${match.hostname} for ${u.email}`);
-          await fetch(
-            `https://api.tailscale.com/api/v2/device/${match.id}/disable`,
-            {
-              method: "POST",
-              headers: { Authorization: `Bearer ${apiKey}` },
-            }
-          );
-          disabled++;
-        }
-
-        await doc.ref.update({ vpnActive: false });
+      if (!snap.empty) {
+        const doc = snap.docs[0];
+        await doc.ref.update({
+          tailscaleNode: d.name,
+          lastSeen: d.lastSeen,
+        });
+        matched++;
       }
-
-      checked++;
     }
 
-    const msg = `✅ Tailscale sync complete: ${checked} users checked, ${disabled} devices disabled`;
-    console.log(msg);
-    res.status(200).send(msg);
+    console.log(`✅ Tailscale sync complete: ${matched}/${devices.length} users matched.`);
+    res.send(`✅ Tailscale sync complete: ${matched}/${devices.length} users matched.`);
   } catch (err) {
-    console.error("❌ Tailscale sync error:", err);
-    res.status(500).send(err.message);
-  }
-});
-
-
-// ---- Admin/manual endpoint: Trigger remote VPN disable (for testing) ----
-app.post("/vpn/disable", async (req, res) => {
-  try {
-    const { username } = req.body;
-    if (!username) return res.status(400).json({ error: "username required" });
-
-    const result = await disableVPNAccess(username);
-    return res.json({ success: result.ok, result });
-  } catch (err) {
-    console.error("vpn/disable error:", err);
-    return res.status(500).json({ error: err.message });
+    console.error("Tailscale sync error:", err.message);
+    res.status(500).send("Sync error: " + err.message);
   }
 });
 
 // ---- Start server ----
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`🚀 SureData backend running on port ${PORT}`);
-});
+app.listen(PORT, () =>
+  console.log(`🚀 SureData backend running on port ${PORT}`)
+);
