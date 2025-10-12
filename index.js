@@ -298,31 +298,6 @@ app.get("/admin/summary", async (req, res) => {
 // ✅ Re-enable JSON parsing for other routes
 app.use(express.json());
 
-// ---- Helper: Disable VPN Access ----
-async function disableVPNAccess(username) {
-  try {
-    const vpnAPI = process.env.VPN_DISABLE_ENDPOINT; // Optional: your local API
-    if (!vpnAPI) {
-      console.warn("⚠️ No VPN_DISABLE_ENDPOINT in .env, skipping VPN disable call");
-      return { ok: false };
-    }
-
-    const res = await fetch(vpnAPI, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username }),
-    });
-
-    if (!res.ok) console.warn(`⚠️ VPN disable call failed for ${username}`);
-    else console.log(`🛑 VPN access disabled for ${username}`);
-
-    return { ok: res.ok };
-  } catch (err) {
-    console.error("❌ disableVPNAccess error:", err.message);
-    return { ok: false, error: err.message };
-  }
-}
-
 // ---- Helper: Send User Notification ----
 async function sendUserNotification(email, type, message) {
   try {
