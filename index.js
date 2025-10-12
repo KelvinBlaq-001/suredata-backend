@@ -4,24 +4,18 @@ import cors from "cors";
 import dotenv from "dotenv";
 import admin from "firebase-admin";
 import crypto from "crypto";
-import fetch from "node-fetch"; // ensure node-fetch is installed
+import fetch from "node-fetch";
 
 dotenv.config();
-
 const app = express();
 
-// --- Note: keep express.raw for the webhook route only. Use json for all others.
-// We'll attach express.json() after the webhook route (see below).
-
-// ---- Initialize Firebase ----
+// --- Firebase Initialization ---
 if (
   !process.env.FIREBASE_PROJECT_ID ||
   !process.env.FIREBASE_CLIENT_EMAIL ||
   !process.env.FIREBASE_PRIVATE_KEY
 ) {
-  console.error(
-    "Missing Firebase env vars. Make sure FIREBASE_PROJECT_ID, FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY are set."
-  );
+  console.error("⚠️ Missing Firebase environment variables");
 }
 
 const serviceAccount = {
@@ -35,536 +29,428 @@ if (!admin.apps.length) {
     credential: admin.credential.cert(serviceAccount),
   });
 }
+
 const db = admin.firestore();
 
-// --- Notification Helper ---
+// --- Notification Helper (FCM-ready stub) ---
 async function sendUserNotification(email, type, message) {
   try {
     console.log(`🔔 Notification [${type}] → ${email}: ${message}`);
-    // save to Firestore
-    const notif = {
+    await db.collection("notifications").add({
       email,
       type,
       message,
       timestamp: new Date().toISOString(),
       read: false,
-    };
-    await db.collection("notifications").add(notif);
-
-    // optional: send email or push notification (hook later)
-    // await sendEmail(email, "SureData Update", message);
+    });
   } catch (err) {
     console.error("Notification error:", err.message);
   }
 }
 
-
-// --------------------------
-// Helper: Disable VPN Access (global, reusable)
-// --------------------------
+// --- Helper: Disable VPN Access ---
 async function disableVPNAccess(username) {
   try {
-    const vpnAPI = process.env.VPN_DISABLE_ENDPOINT; // e.g. "http://127.0.0.1:8081/vpn/disable"
+    const vpnAPI = process.env.VPN_DISABLE_ENDPOINT;
     if (!vpnAPI) {
-      console.warn("⚠️ No VPN_DISABLE_ENDPOINT set in env - skipping actual disable call");
+      console.warn("⚠️ No VPN_DISABLE_ENDPOINT set — skipping actual disable call");
       return { ok: false, reason: "no_endpoint" };
     }
 
-    const r = await fetch(vpnAPI, {
+    const res = await fetch(vpnAPI, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username }),
     });
 
-    if (!r.ok) {
-      const text = await r.text();
-      console.warn(`⚠️ Failed to disable VPN for ${username} (${r.status}) - ${text}`);
-      return { ok: false, status: r.status, text };
+    if (!res.ok) {
+      const text = await res.text();
+      console.warn(`⚠️ Failed to disable VPN for ${username}: ${text}`);
+      return { ok: false, status: res.status, text };
     }
 
     console.log(`🛑 VPN access disabled for ${username}`);
     return { ok: true };
   } catch (err) {
-    console.error("❌ disableVPNAccess error:", err.message);
+    console.error("disableVPNAccess error:", err.message);
     return { ok: false, error: err.message };
   }
 }
 
-// ---------------------------- 
+// ----------------------------
 // PAYSTACK WEBHOOK (with rollover logic)
 // ----------------------------
-// Use express.raw for this route ONLY so we can verify signature with the raw bytes
 app.post(
   "/payments/webhook",
   express.raw({ type: "application/json" }),
   async (req, res) => {
     try {
       const secret = process.env.PAYSTACK_SECRET_KEY;
-      if (!secret) {
-        console.error("Missing PAYSTACK_SECRET_KEY in env");
-        return res.status(500).send("Server misconfigured");
-      }
+      if (!secret) return res.status(500).send("Server misconfigured");
 
-      const rawBody = Buffer.isBuffer(req.body) ? req.body : Buffer.from(JSON.stringify(req.body));
-      const computedHash = crypto.createHmac("sha512", secret).update(rawBody).digest("hex");
+      const rawBody = Buffer.isBuffer(req.body)
+        ? req.body
+        : Buffer.from(JSON.stringify(req.body));
+
+      const computedHash = crypto
+        .createHmac("sha512", secret)
+        .update(rawBody)
+        .digest("hex");
+
       const receivedHash = req.headers["x-paystack-signature"];
 
-      // Optionally support a test bypass in non-production (helpful for manual tests)
-      if (process.env.NODE_ENV !== "production" && receivedHash === "test-bypass") {
-        console.log("🧪 Paystack signature bypass (test mode)");
+      if (
+        process.env.NODE_ENV !== "production" &&
+        receivedHash === "test-bypass"
+      ) {
+        console.log("🧪 Paystack test-bypass active");
       } else if (computedHash !== receivedHash) {
-        console.warn("⚠️ Invalid Paystack signature");
         return res.status(400).send("Invalid signature");
       }
 
       const event = JSON.parse(rawBody.toString());
-      console.log("📩 Paystack event:", event.event);
+      if (event.event !== "charge.success") return res.sendStatus(200);
 
-      if (event.event === "charge.success") {
-        const data = event.data;
-        const reference = data.reference;
-        const amount = data.amount / 100; // Paystack sends kobo
-        const email = (data.customer?.email || "").toLowerCase();
+      const data = event.data;
+      const reference = data.reference;
+      const amount = data.amount / 100;
+      const email = (data.customer?.email || "").toLowerCase();
 
-        console.log(`💰 Payment from ${email}: ₦${amount}`);
+      const plans = {
+        500: { name: "N500", dataLimit: 1 * 1024, days: 30 },
+        1000: { name: "N1000", dataLimit: 3 * 1024, days: 30 },
+        2000: { name: "N2000", dataLimit: 8 * 1024, days: 30 },
+        5000: { name: "N5000", dataLimit: 20 * 1024, days: 30 },
+      };
 
-        // Firestore: find user
-        const usersRef = db.collection("users");
-        const snapshot = await usersRef.where("email", "==", email).limit(1).get();
+      const plan = plans[amount];
+      if (!plan) return res.sendStatus(200);
 
-        if (snapshot.empty) {
-          console.warn("⚠️ No user found for:", email);
-          // still record transaction
-          await db.collection("transactions").doc(reference).set({
-            email,
-            reference,
-            amount,
-            status: "success",
-            timestamp: new Date().toISOString(),
-            note: "user_not_found",
-          });
-          return res.sendStatus(200);
+      const usersRef = db.collection("users");
+      const snap = await usersRef.where("email", "==", email).limit(1).get();
+      if (snap.empty) {
+        await db.collection("transactions").doc(reference).set({
+          email,
+          reference,
+          amount,
+          status: "success",
+          timestamp: new Date().toISOString(),
+          note: "user_not_found",
+        });
+        return res.sendStatus(200);
+      }
+
+      const userRef = snap.docs[0].ref;
+
+      await db.runTransaction(async (t) => {
+        const doc = await t.get(userRef);
+        if (!doc.exists) throw new Error("User not found");
+        const u = doc.data();
+
+        const now = new Date();
+        const currentDataUsed = u.dataUsed || 0;
+        const currentPlanLimit = u.planLimit || 0;
+        const currentExpiry = u.expiryDate ? new Date(u.expiryDate) : null;
+        const isActive = currentExpiry && currentExpiry > now;
+
+        const newExpiry = new Date();
+        newExpiry.setDate(newExpiry.getDate() + plan.days);
+
+        let finalPlanLimit, finalExpiry;
+        if (isActive) {
+          const remainingData = Math.max(currentPlanLimit - currentDataUsed, 0);
+          finalPlanLimit = remainingData + plan.dataLimit;
+          finalExpiry =
+            newExpiry > currentExpiry ? newExpiry : currentExpiry;
+        } else {
+          finalPlanLimit = plan.dataLimit;
+          finalExpiry = newExpiry;
         }
 
-        const userDoc = snapshot.docs[0];
-        const userRef = userDoc.ref;
-
-        // plan map (NGN -> MB and days)
-        const plans = {
-          500: { name: "N500", dataLimit: 1 * 1024, days: 30 }, // 1GB => 1024 MB
-          1000: { name: "N1000", dataLimit: 3 * 1024, days: 30 }, // 3GB
-          2000: { name: "N2000", dataLimit: 8 * 1024, days: 30 }, // 8GB
-          5000: { name: "N5000", dataLimit: 20 * 1024, days: 30 }, // 20GB
+        const updates = {
+          balance: (u.balance || 0) + amount,
+          currentPlan: plan.name,
+          planLimit: finalPlanLimit,
+          dataUsed: 0,
+          expiryDate: finalExpiry.toISOString(),
+          vpnActive: true,
+          lastPayment: { reference, amount, date: now.toISOString() },
+          updatedAt: now.toISOString(),
         };
 
-        const plan = plans[amount];
-        if (!plan) {
-          console.warn(`⚠️ Unknown plan amount: ₦${amount}`);
-          // still record transaction but ignore plan application
-          await db.collection("transactions").doc(reference).set({
-            uid: userRef.id,
-            email,
-            reference,
-            amount,
-            status: "success",
-            plan: null,
-            timestamp: new Date().toISOString(),
-          });
-          return res.sendStatus(200);
-        }
-
-        // transaction: compute rollover/stacking safely
-        await db.runTransaction(async (t) => {
-          const snap = await t.get(userRef);
-          if (!snap.exists) throw new Error("User not found during transaction");
-          const u = snap.data();
-
-          const now = new Date();
-          const currentDataUsed = u.dataUsed || 0;
-          const currentPlanLimit = u.planLimit || 0;
-          const currentExpiry = u.expiryDate ? new Date(u.expiryDate) : null;
-          const isPlanActive = currentExpiry && currentExpiry > now;
-
-          // new expiry (from now)
-          const newExpiry = new Date();
-          newExpiry.setDate(newExpiry.getDate() + plan.days);
-
-          let finalPlanLimit;
-          let finalExpiry;
-
-          if (isPlanActive) {
-            const remainingData = Math.max(currentPlanLimit - currentDataUsed, 0);
-            finalPlanLimit = remainingData + plan.dataLimit;
-            // choose the later expiry (keeps longest valid window)
-            finalExpiry = newExpiry > currentExpiry ? newExpiry : currentExpiry;
-            console.log(`🔄 Rollover applied for ${email}: ${remainingData}MB + ${plan.dataLimit}MB`);
-          } else {
-            finalPlanLimit = plan.dataLimit;
-            finalExpiry = newExpiry;
-            console.log(`🆕 New plan started for ${email}: ${plan.dataLimit}MB`);
-          }
-
-          const updates = {
-            balance: (u.balance || 0) + amount,
-            currentPlan: plan.name,
-            planLimit: finalPlanLimit,
-            dataUsed: 0,
-            expiryDate: finalExpiry.toISOString(),
-            vpnActive: true,
-            lastPayment: { reference, amount, date: now.toISOString() },
-            updatedAt: now.toISOString(),
-          };
-
-          t.update(userRef, updates);
-
-          const txRef = db.collection("transactions").doc(reference);
-          t.set(txRef, {
-            uid: userRef.id,
-            email,
-            reference,
-            amount,
-            status: "success",
-            plan: plan.name,
-            dataAdded: plan.dataLimit,
-            totalLimit: finalPlanLimit,
-            timestamp: new Date().toISOString(),
-          });
+        t.update(userRef, updates);
+        t.set(db.collection("transactions").doc(reference), {
+          uid: userRef.id,
+          email,
+          reference,
+          amount,
+          status: "success",
+          plan: plan.name,
+          dataAdded: plan.dataLimit,
+          totalLimit: finalPlanLimit,
+          timestamp: new Date().toISOString(),
         });
+      });
 
-        console.log(`✅ ${email} purchased ${plan.name} (${plan.dataLimit}MB)`);
-      }
-await sendUserNotification(
-  email,
-  "plan_activated",
-  `Your ${plan.name} plan (${plan.dataLimit / 1024}GB) has been activated. Enjoy secure browsing!`
-);
+      await sendUserNotification(
+        email,
+        "plan_activated",
+        `Your ${plan.name} plan (${plan.dataLimit / 1024}GB) has been activated.`
+      );
 
-
-      return res.sendStatus(200);
+      res.sendStatus(200);
     } catch (err) {
-      console.error("❌ Webhook error:", err && err.message ? err.message : err);
-      return res.sendStatus(500);
+      console.error("Webhook error:", err.message);
+      res.sendStatus(500);
     }
   }
 );
 
-// Re-enable JSON parsing for all other routes
+// --- Enable JSON parsing for other routes ---
 app.use(express.json());
 app.use(cors());
 
-// ---- Helper: find user by identifier (username | email | phone)
-async function findUserDocByIdentifier(identifier) {
-  if (!identifier) return null;
-  const users = db.collection("users");
+// ---------------------
+// General Health / Admin
+// ---------------------
+app.get("/health", (_, res) => res.status(200).send("OK"));
 
-  let snap = await users.where("username", "==", identifier).limit(1).get();
-  if (!snap.empty) return snap.docs[0];
-
-  if (identifier.includes("@")) {
-    snap = await users.where("email", "==", identifier.toLowerCase()).limit(1).get();
-    if (!snap.empty) return snap.docs[0];
-  }
-
-  snap = await users.where("phone", "==", identifier).limit(1).get();
-  if (!snap.empty) return snap.docs[0];
-
-  return null;
-}
-
-// ---- Health & admin endpoints ----
-app.get("/health", (req, res) => res.status(200).send("OK"));
-
-app.get("/admin/summary", async (req, res) => {
+app.get("/admin/summary", async (_, res) => {
   try {
-    const usersSnap = await db.collection("users").get();
+    const snap = await db.collection("users").get();
     const now = new Date();
-    let total = usersSnap.size,
+    let total = 0,
       active = 0,
       expired = 0,
       withPlan = 0;
-    usersSnap.forEach((doc) => {
+
+    snap.forEach((doc) => {
+      total++;
       const u = doc.data();
       if (u.vpnActive) active++;
       if (u.expiryDate && new Date(u.expiryDate) < now) expired++;
       if (u.currentPlan) withPlan++;
     });
+
     res.json({ total, active, expired, withPlan });
   } catch (err) {
-    console.error("admin/summary error:", err);
+    console.error("admin/summary error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ✅ Re-enable JSON parsing for other routes
-app.use(express.json());
-
-// ---- Helper: Send User Notification ----
-async function sendUserNotification(email, type, message) {
-  try {
-    // For now just log — FCM will replace this later
-    console.log(`🔔 [${type}] Notification for ${email}: ${message}`);
-  } catch (err) {
-    console.error("Notification error:", err.message);
-  }
-}
-
-// ---- VPN SESSION CONNECT ----
+// ----------------------
+// VPN SESSION HANDLERS
+// ----------------------
 app.post("/vpn/session/connect", async (req, res) => {
   try {
     const { username, vpn_ip } = req.body;
-    console.log("🟢 VPN Connect triggered for:", username, vpn_ip);
+    const snap = await db.collection("users").where("email", "==", username).limit(1).get();
+    if (snap.empty) return res.status(404).json({ error: "User not found" });
 
-    const snapshot = await db.collection("users").where("email", "==", username).limit(1).get();
-    if (snapshot.empty) {
-      console.log("⚠️ No user found for:", username);
-      return res.status(404).json({ error: "User not found" });
-    }
-
-    const userDoc = snapshot.docs[0];
-    await userDoc.ref.update({
+    await snap.docs[0].ref.update({
       vpnActive: true,
       vpnIP: vpn_ip,
       lastConnect: new Date().toISOString(),
     });
 
-    console.log(`✅ Updated user ${username} as connected`);
     res.json({ success: true });
-  } catch (error) {
-    console.error("❌ Connect error:", error.message);
-    res.status(500).json({ error: error.message });
+  } catch (err) {
+    console.error("Connect error:", err.message);
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ---- VPN SESSION DISCONNECT ----
 app.post("/vpn/session/disconnect", async (req, res) => {
   try {
-    const { username, vpn_ip, data_used_mb = 0 } = req.body;
-    console.log("🔴 VPN Disconnect triggered for:", username, vpn_ip, "Data used:", data_used_mb, "MB");
+    const { username, data_used_mb = 0 } = req.body;
+    const snap = await db.collection("users").where("email", "==", username).limit(1).get();
+    if (snap.empty) return res.status(404).json({ error: "User not found" });
 
-    const snapshot = await db.collection("users").where("email", "==", username).limit(1).get();
-    if (snapshot.empty) return res.status(404).json({ error: "User not found" });
+    const doc = snap.docs[0];
+    const u = doc.data();
+    const used = (u.dataUsed || 0) + data_used_mb;
+    const over = used >= (u.planLimit || Infinity);
+    const expired = u.expiryDate && new Date(u.expiryDate) < new Date();
 
-    const userDoc = snapshot.docs[0];
-    const user = userDoc.data();
-
-    const updatedDataUsed = (user.dataUsed || 0) + data_used_mb;
-    const overLimit = updatedDataUsed >= (user.planLimit || Infinity);
-    const expired = user.expiryDate && new Date(user.expiryDate) < new Date();
-
-    const updates = {
-      dataUsed: updatedDataUsed,
-      vpnActive: !overLimit && !expired,
+    await doc.ref.update({
+      dataUsed: used,
+      vpnActive: !over && !expired,
       lastDisconnect: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-    };
+    });
 
-    await userDoc.ref.update(updates);
-    console.log(`✅ Updated user ${username} as disconnected. Total used: ${updatedDataUsed}MB`);
-
-    if (overLimit || expired) {
-      console.log(`⚠️ Auto-disabling VPN for ${username}`);
+    if (over || expired) {
       await disableVPNAccess(username);
-
       await sendUserNotification(
         username,
         "plan_exhausted",
         expired
-          ? "Your data plan has expired. Please renew to restore access."
-          : "Your data limit has been exhausted. Please purchase a new plan."
+          ? "Your plan has expired. Please renew."
+          : "Your data limit has been exhausted."
       );
     }
 
-    res.json({ success: true, username, dataUsed: updatedDataUsed, overLimit, expired });
-  } catch (error) {
-    console.error("❌ Disconnect error:", error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ---- VPN SESSION USAGE UPDATE ----
-app.post("/vpn/session/update-usage", async (req, res) => {
-  try {
-    const { username, usage_mb = 0 } = req.body;
-    console.log(`📊 Updating usage for ${username}: +${usage_mb}MB`);
-
-    const snap = await db.collection("users").where("email", "==", username).limit(1).get();
-    if (snap.empty) return res.status(404).json({ error: "User not found" });
-
-    const userDoc = snap.docs[0];
-    const user = userDoc.data();
-
-    const newDataUsed = (user.dataUsed || 0) + usage_mb;
-    const usagePercent = (newDataUsed / (user.planLimit || 1)) * 100;
-
-    if (usagePercent >= 90 && usagePercent < 100) {
-      await sendUserNotification(
-        username,
-        "plan_near_limit",
-        `⚠️ Heads up! You've used ${usagePercent.toFixed(0)}% of your data plan.`
-      );
-    }
-
-    const overLimit = newDataUsed >= (user.planLimit || Infinity);
-    const expired = user.expiryDate && new Date(user.expiryDate) < new Date();
-
-    const updates = {
-      dataUsed: newDataUsed,
-      vpnActive: !overLimit && !expired,
-      updatedAt: new Date().toISOString(),
-    };
-
-    await userDoc.ref.update(updates);
-    console.log(`✅ Updated usage for ${username}. Total: ${newDataUsed}MB`);
-
-    if (overLimit || expired) {
-      console.log(`⚠️ Auto-disabling VPN for ${username}`);
-      await disableVPNAccess(username);
-
-      await sendUserNotification(
-        username,
-        "plan_exhausted",
-        overLimit
-          ? "🚫 Your data plan has been exhausted."
-          : "⌛ Your data plan has expired."
-      );
-    }
-
-    res.json({ success: true, username, dataUsed: newDataUsed, overLimit, expired });
+    res.json({ success: true });
   } catch (err) {
-    console.error("❌ Usage update error:", err.message);
+    console.error("Disconnect error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ---- AUTO EXPIRE CHECK ----
-app.all("/cron/expire-check", async (req, res) => {
+app.post("/vpn/session/update-usage", async (req, res) => {
   try {
-    console.log("⏰ Running expire-check...");
-    const now = new Date();
-    const usersSnap = await db.collection("users").get();
-    let count = 0;
+    const { username, usage_mb = 0 } = req.body;
+    const snap = await db.collection("users").where("email", "==", username).limit(1).get();
+    if (snap.empty) return res.status(404).json({ error: "User not found" });
 
-    for (const doc of usersSnap.docs) {
+    const doc = snap.docs[0];
+    const u = doc.data();
+    const used = (u.dataUsed || 0) + usage_mb;
+    const percent = (used / (u.planLimit || 1)) * 100;
+
+    if (percent >= 90 && percent < 100) {
+      await sendUserNotification(
+        username,
+        "plan_near_limit",
+        `⚠️ You've used ${percent.toFixed(0)}% of your plan.`
+      );
+    }
+
+    const over = used >= (u.planLimit || Infinity);
+    const expired = u.expiryDate && new Date(u.expiryDate) < new Date();
+
+    await doc.ref.update({
+      dataUsed: used,
+      vpnActive: !over && !expired,
+      updatedAt: new Date().toISOString(),
+    });
+
+    if (over || expired) {
+      await disableVPNAccess(username);
+      await sendUserNotification(
+        username,
+        "plan_exhausted",
+        over
+          ? "🚫 Your data plan has been exhausted."
+          : "⌛ Your plan has expired."
+      );
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Usage update error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ----------------------
+// CRON JOBS
+// ----------------------
+app.all("/cron/expire-check", async (_, res) => {
+  try {
+    const now = new Date();
+    const snap = await db.collection("users").get();
+    let disabled = 0;
+
+    for (const doc of snap.docs) {
       const u = doc.data();
       const expired = u.expiryDate && new Date(u.expiryDate) < now;
-      const exhausted = (u.planLimit || 0) > 0 && (u.dataUsed || 0) >= u.planLimit;
+      const exhausted =
+        (u.planLimit || 0) > 0 && (u.dataUsed || 0) >= u.planLimit;
 
       if (expired || exhausted) {
         await doc.ref.update({ vpnActive: false, updatedAt: new Date().toISOString() });
         await disableVPNAccess(u.email || u.username || doc.id);
-        await sendUserNotification(
-          u.email,
-          "plan_expired",
-          "Your plan has expired. Renew to reactivate your VPN."
-        );
-        count++;
+        disabled++;
       }
     }
 
-    res.status(200).send(`✅ Processed ${usersSnap.size} users, disabled ${count}`);
+    res.status(200).send(`✅ Disabled ${disabled} users`);
   } catch (err) {
-    console.error("Expiry check error:", err);
-    res.status(500).send("Cron error: " + err.message);
-  }
-});
-
-// ---- TAILSCALE SYNC ----
-app.get("/cron/tailscale-sync", async (req, res) => {
-  try {
-    const tailnet = process.env.TAILSCALE_TAILNET;
-    const apiKey = process.env.TAILSCALE_API_KEY;
-
-    if (!tailnet || !apiKey) {
-      console.warn("⚠️ Missing TAILSCALE_API_KEY or TAILSCALE_TAILNET");
-      return res.status(500).send("Tailscale config missing");
-    }
-
-    console.log("🔄 Fetching Tailscale devices...");
-    const response = await fetch(
-      `https://api.tailscale.com/api/v2/tailnet/${encodeURIComponent(tailnet)}/devices`,
-      { headers: { Authorization: `Bearer ${apiKey}` } }
-    );
-
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Tailscale API error ${response.status}: ${text}`);
-    }
-
-    const data = await response.json();
-    const devices = data.devices || [];
-    console.log(`📡 Found ${devices.length} Tailscale devices`);
-
-    const usersSnap = await db.collection("users").get();
-    const now = new Date();
-    let checked = 0, disabled = 0;
-
-    for (const doc of usersSnap.docs) {
-      const u = doc.data();
-      const expired = u.expiryDate && new Date(u.expiryDate) < now;
-      const exhausted = (u.planLimit || 0) > 0 && (u.dataUsed || 0) >= u.planLimit;
-
-      if (expired || exhausted) {
-        const match = devices.find(
-          (d) =>
-            d.user?.toLowerCase().includes((u.email || "").toLowerCase()) ||
-            d.hostname?.toLowerCase().includes((u.email || "").split("@")[0].toLowerCase())
-        );
-
-        if (match) {
-          console.log(`🛑 Disabling device ${match.hostname} for ${u.email}`);
-          await fetch(
-            `https://api.tailscale.com/api/v2/device/${match.id}/disable`,
-            {
-              method: "POST",
-              headers: { Authorization: `Bearer ${apiKey}` },
-            }
-          );
-          disabled++;
-        }
-
-        await doc.ref.update({ vpnActive: false });
-      }
-
-      checked++;
-    }
-
-    const msg = `✅ Tailscale sync complete: ${checked} users checked, ${disabled} devices disabled`;
-    console.log(msg);
-    res.status(200).send(msg);
-  } catch (err) {
-    console.error("❌ Tailscale sync error:", err);
+    console.error("Cron expire-check error:", err.message);
     res.status(500).send(err.message);
   }
 });
 
-// ---- /notify/test ----
+app.get("/cron/tailscale-sync", async (_, res) => {
+  try {
+    const tailnet = process.env.TAILSCALE_TAILNET;
+    const apiKey = process.env.TAILSCALE_API_KEY;
+
+    if (!tailnet || !apiKey)
+      return res.status(500).send("Missing Tailscale config");
+
+    const response = await fetch(
+      `https://api.tailscale.com/api/v2/tailnet/${encodeURIComponent(
+        tailnet
+      )}/devices`,
+      { headers: { Authorization: `Bearer ${apiKey}` } }
+    );
+
+    if (!response.ok) throw new Error(`Tailscale API error ${response.status}`);
+    const data = await response.json();
+    const devices = data.devices || [];
+
+    const snap = await db.collection("users").get();
+    const now = new Date();
+    let disabled = 0;
+
+    for (const doc of snap.docs) {
+      const u = doc.data();
+      const expired = u.expiryDate && new Date(u.expiryDate) < now;
+      const exhausted =
+        (u.planLimit || 0) > 0 && (u.dataUsed || 0) >= u.planLimit;
+
+      if (expired || exhausted) {
+        const match = devices.find((d) =>
+          d.user?.toLowerCase().includes((u.email || "").toLowerCase())
+        );
+        if (match) {
+          await fetch(
+            `https://api.tailscale.com/api/v2/device/${match.id}/disable`,
+            { method: "POST", headers: { Authorization: `Bearer ${apiKey}` } }
+          );
+          disabled++;
+        }
+        await doc.ref.update({ vpnActive: false });
+      }
+    }
+
+    res.status(200).send(`✅ Disabled ${disabled} devices`);
+  } catch (err) {
+    console.error("Tailscale sync error:", err.message);
+    res.status(500).send(err.message);
+  }
+});
+
+// ----------------------
+// Misc. Test Endpoints
+// ----------------------
 app.post("/notify/test", async (req, res) => {
   try {
-    const { email, message = "This is a test notification" } = req.body;
+    const { email, message = "Test notification" } = req.body;
     if (!email) return res.status(400).json({ error: "Email required" });
 
     await sendUserNotification(email, "test", message);
-    res.json({ success: true, email, message });
+    res.json({ success: true });
   } catch (err) {
-    console.error("❌ Notify test error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ---- Admin/manual endpoint: Trigger remote VPN disable (for testing) ----
 app.post("/vpn/disable", async (req, res) => {
   try {
     const { username } = req.body;
     if (!username) return res.status(400).json({ error: "username required" });
 
     const result = await disableVPNAccess(username);
-    return res.json({ success: result.ok, result });
+    res.json({ success: result.ok, result });
   } catch (err) {
-    console.error("vpn/disable error:", err);
-    return res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message });
   }
 });
 
-// ---- Start server ----
+// --- Start Server ---
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`🚀 SureData backend running on port ${PORT}`));
