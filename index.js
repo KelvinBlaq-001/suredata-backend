@@ -146,37 +146,38 @@ app.post(
         const doc = await t.get(userRef);
         if (!doc.exists) throw new Error("User not found");
         const u = doc.data();
+const now = new Date();
+const currentDataUsed = u.dataUsed || 0;
+const currentPlanLimit = u.planLimit || 0;
+const currentExpiry = u.expiryDate ? new Date(u.expiryDate) : null;
+const isActive = currentExpiry && currentExpiry > now;
 
-        const now = new Date();
-        const currentDataUsed = u.dataUsed || 0;
-        const currentPlanLimit = u.planLimit || 0;
-        const currentExpiry = u.expiryDate ? new Date(u.expiryDate) : null;
-        const isActive = currentExpiry && currentExpiry > now;
+const newExpiry = new Date();
+newExpiry.setDate(newExpiry.getDate() + plan.days);
 
-        const newExpiry = new Date();
-        newExpiry.setDate(newExpiry.getDate() + plan.days);
+let finalPlanLimit = plan.dataLimit;
+let finalExpiry = newExpiry;
 
-        let finalPlanLimit, finalExpiry;
-        if (isActive) {
-          const remainingData = Math.max(currentPlanLimit - currentDataUsed, 0);
-          finalPlanLimit = remainingData + plan.dataLimit;
-          finalExpiry =
-            newExpiry > currentExpiry ? newExpiry : currentExpiry;
-        } else {
-          finalPlanLimit = plan.dataLimit;
-          finalExpiry = newExpiry;
-        }
+// ✅ If user still has an active plan, roll over unused data
+if (isActive) {
+  const remainingData = Math.max(currentPlanLimit - currentDataUsed, 0);
+  finalPlanLimit += remainingData; // add leftover data to new plan
+  finalExpiry =
+    newExpiry > currentExpiry ? newExpiry : currentExpiry; // extend or keep
+}
 
-        const updates = {
-          balance: (u.balance || 0) + amount,
-          currentPlan: plan.name,
-          planLimit: finalPlanLimit,
-          dataUsed: 0,
-          expiryDate: finalExpiry.toISOString(),
-          vpnActive: true,
-          lastPayment: { reference, amount, date: now.toISOString() },
-          updatedAt: now.toISOString(),
-        };
+// ✅ Reset usage only if plan had expired, otherwise keep tracking usage
+const updates = {
+  balance: (u.balance || 0) + amount,
+  currentPlan: plan.name,
+  planLimit: finalPlanLimit,
+  dataUsed: isActive ? currentDataUsed : 0,
+  expiryDate: finalExpiry.toISOString(),
+  vpnActive: true,
+  lastPayment: { reference, amount, date: now.toISOString() },
+  updatedAt: now.toISOString(),
+};
+
 
         t.update(userRef, updates);
         t.set(db.collection("transactions").doc(reference), {
