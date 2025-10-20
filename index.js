@@ -206,13 +206,19 @@ app.post(
   }
 );
 
-// --- Enable JSON parsing for other routes ---
+// --- Enable JSON parsing + add request logger middleware ---
 app.use(express.json());
 app.use(cors());
 
-// ---------------------
-// General Health / Admin
-// ---------------------
+// 🪵 Universal request logger — this is the new part
+app.use((req, res, next) => {
+  console.log(`➡️  ${req.method} ${req.originalUrl}`);
+  next();
+});
+
+// ----------------------
+// Health / Admin
+// ----------------------
 app.get("/health", (_, res) => res.status(200).send("OK"));
 
 app.get("/admin/summary", async (_, res) => {
