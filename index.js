@@ -80,82 +80,126 @@ async function disableVPNAccess(username) {
 // ----------------------------
 // PAYSTACK WEBHOOK (with rollover logic)
 // ----------------------------
-app.post('/payments/webhook', async (req, res) => {
-  try {
-    const signature = req.headers['x-paystack-signature'];
-    if (!signature || signature === 'test-bypass') {
-      console.log('⚠️ Invalid or test signature, bypassing verification for testing.');
-    } else {
-      const crypto = await import('crypto');
-      const secret = process.env.PAYSTACK_SECRET;
-      const hash = crypto.createHmac('sha512', secret).update(JSON.stringify(req.body)).digest('hex');
-      if (hash !== signature) {
-        console.log('⚠️ Invalid Paystack signature');
-        return res.status(400).send('Invalid signature');
+import crypto from "crypto";
+
+app.post(
+  "/payments/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    try {
+      const secret = process.env.PAYSTACK_SECRET_KEY; // ✅ fixed variable name
+      if (!secret) {
+        console.error("❌ PAYSTACK_SECRET_KEY missing in .env");
+        return res.status(500).send("Server misconfigured");
       }
+
+      const rawBody = Buffer.isBuffer(req.body)
+        ? req.body
+        : Buffer.from(JSON.stringify(req.body));
+
+      const computedHash = crypto
+        .createHmac("sha512", secret)
+        .update(rawBody)
+        .digest("hex");
+
+      const receivedHash = req.headers["x-paystack-signature"];
+
+      // ✅ Allow easy testing
+      if (
+        process.env.NODE_ENV !== "production" &&
+        receivedHash === "test-bypass"
+      ) {
+        console.log("🧪 Paystack test-bypass active");
+      } else if (computedHash !== receivedHash) {
+        console.log("⚠️ Invalid Paystack signature");
+        return res.status(400).send("Invalid signature");
+      }
+
+      const event = JSON.parse(rawBody.toString());
+      if (event.event !== "charge.success") return res.sendStatus(200);
+
+      const data = event.data;
+      const reference = data.reference;
+      const amount = data.amount / 100;
+      const email = (data.customer?.email || "").toLowerCase();
+
+      // ✅ Match plan by amount
+      const plans = {
+        500: { name: "Basic Plan", dataLimit: 2 * 1024, days: 30 },
+        1000: { name: "Standard Plan", dataLimit: 4 * 1024, days: 30 },
+        2000: { name: "Pro Plan", dataLimit: 8 * 1024, days: 30 },
+        5000: { name: "Ultra Plan", dataLimit: 20 * 1024, days: 30 },
+      };
+      const plan = plans[amount];
+      if (!plan) return res.sendStatus(200);
+
+      // ✅ Find user
+      const usersRef = db.collection("users");
+      const snap = await usersRef.where("email", "==", email).limit(1).get();
+      if (snap.empty) {
+        console.log(`❌ User not found for email ${email}`);
+        await db.collection("transactions").doc(reference).set({
+          email,
+          reference,
+          amount,
+          status: "success",
+          timestamp: new Date().toISOString(),
+          note: "user_not_found",
+        });
+        return res.sendStatus(200);
+      }
+
+      const userRef = snap.docs[0].ref;
+      const userData = snap.docs[0].data();
+
+      // ✅ Compute rollover if applicable
+      const now = new Date();
+      const currentExpiry = userData.expiryDate
+        ? new Date(userData.expiryDate)
+        : null;
+      const isActive = currentExpiry && currentExpiry > now;
+
+      const newExpiry = new Date();
+      newExpiry.setDate(newExpiry.getDate() + plan.days);
+
+      const remainingData = Math.max(
+        (userData.planLimit || 0) - (userData.dataUsed || 0),
+        0
+      );
+
+      let totalLimit = plan.dataLimit;
+      if (isActive && remainingData > 0) {
+        totalLimit += remainingData;
+        console.log(
+          `🔄 Rollover applied for ${email}: ${remainingData}MB leftover + ${plan.dataLimit}MB new`
+        );
+      }
+
+      await userRef.update({
+        currentPlan: plan.name,
+        planLimit: totalLimit,
+        dataUsed: isActive ? userData.dataUsed || 0 : 0,
+        expiryDate: newExpiry.toISOString(),
+        vpnActive: true,
+        lastPayment: {
+          amount,
+          reference,
+          date: now.toISOString(),
+        },
+        updatedAt: now.toISOString(),
+      });
+
+      console.log(
+        `✅ ${email} purchased ${plan.name} — total ${totalLimit}MB (after rollover if any)`
+      );
+
+      res.sendStatus(200);
+    } catch (err) {
+      console.error("❌ Webhook error:", err);
+      res.sendStatus(500);
     }
-
-    const event = req.body.event;
-    const data = req.body.data;
-    if (event !== 'charge.success') return res.status(200).send('ignored');
-
-    const email = data.customer.email;
-    const amountNaira = data.amount / 100;
-    const plans = {
-      500: { name: 'Basic Plan', limit: 2048 },
-      1000: { name: 'Standard Plan', limit: 4096 },
-      2000: { name: 'Pro Plan', limit: 8192 },
-      5000: { name: 'Ultra Plan', limit: 20480 }
-    };
-    const plan = plans[amountNaira];
-    if (!plan) {
-      console.log(`⚠️ Unknown plan for ₦${amountNaira}`);
-      return res.status(200).send('no plan matched');
-    }
-
-    const userRef = db.collection('users').where('email', '==', email);
-    const snap = await userRef.get();
-    if (snap.empty) {
-      console.log(`❌ No user found for ${email}`);
-      return res.status(404).send('User not found');
-    }
-
-    const userDoc = snap.docs[0];
-    const user = userDoc.data();
-
-    const now = new Date();
-    const newExpiry = new Date();
-    newExpiry.setDate(now.getDate() + 30);
-
-    const leftover = Math.max(0, user.planLimit - user.dataUsed);
-    let totalLimit = plan.limit;
-
-    if (leftover > 0) {
-      totalLimit += leftover;
-      console.log(`🔄 Rollover applied for ${email}: ${leftover}MB leftover + ${plan.limit}MB new`);
-    }
-
-    await userDoc.ref.update({
-      currentPlan: plan.name,
-      planLimit: totalLimit,
-      dataUsed: 0,
-      expiryDate: newExpiry.toISOString(),
-      vpnActive: true,
-      lastPayment: {
-        amount: amountNaira,
-        date: now.toISOString(),
-        reference: data.reference || '',
-      },
-      updatedAt: now.toISOString(),
-    });
-
-    console.log(`✅ ${email} purchased ${plan.name} — ${totalLimit}MB total (after rollover if any)`);
-    res.status(200).send('ok');
-  } catch (err) {
-    console.error('❌ Payment webhook error:', err);
-    res.status(500).send('error');
   }
-});
+);
 
 
 // --- Enable JSON parsing + add request logger middleware ---
