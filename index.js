@@ -40,7 +40,7 @@ async function sendUserNotification(email, type, message) {
       email,
       type,
       message,
-      timestamp: new Date().toISOString(),
+      timestamp: admin.firestore.FieldValue.serverTimestamp(), // ✅ Proper Firestore Timestamp
       read: false,
     });
   } catch (err) {
@@ -199,7 +199,6 @@ app.post(
   }
 );
 
-
 // --- Enable JSON parsing + add request logger middleware ---
 app.use(express.json());
 app.use(cors());
@@ -209,6 +208,9 @@ app.use((req, res, next) => {
   console.log(`➡️  ${req.method} ${req.originalUrl}`);
   next();
 });
+
+// (all your other code remains unchanged below)
+
 
 // ----------------------
 // Health / Admin
