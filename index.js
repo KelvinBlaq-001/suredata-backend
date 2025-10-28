@@ -192,6 +192,13 @@ app.post(
         `✅ ${email} purchased ${plan.name} — total ${totalLimit}MB (after rollover if any)`
       );
 
+// 📨 Send notification to Firestore
+await sendUserNotification(
+  email,
+  "plan_purchased",
+  `🎉 You’ve successfully purchased the ${plan.name}. Total: ${totalLimit}MB.`
+);
+
       res.sendStatus(200);
     } catch (err) {
       console.error("❌ Webhook error:", err);
