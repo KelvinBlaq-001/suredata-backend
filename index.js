@@ -40,7 +40,7 @@ async function sendUserNotification(email, type, message) {
       email,
       type,
       message,
-      timestamp: admin.firestore.FieldValue.serverTimestamp(), // ✅ Proper Firestore Timestamp
+      timestamp: admin.firestore.FieldValue.serverTimestamp(), // Proper Firestore Timestamp
       read: false,
     });
   } catch (err) {
@@ -48,29 +48,143 @@ async function sendUserNotification(email, type, message) {
   }
 }
 
+// ----------------------
+// TAILSCALE INTEGRATION
+// ----------------------
+// Requires:
+//   TAILSCALE_API_KEY (api key from Tailscale: machine user or service key)
+//   TAILSCALE_TAILNET (your tailnet name, e.g. example.tailscale.net or tailnet slug)
 
-// --- Helper: Disable VPN Access ---
+function _tailscaleAuthHeader() {
+  const apiKey = process.env.TAILSCALE_API_KEY || "";
+  // Tailscale expects Basic auth with the API key as username and empty password
+  // "Authorization: Basic base64(apiKey + ':')"
+  const token = Buffer.from(`${apiKey}:`).toString("base64");
+  return `Basic ${token}`;
+}
+
+async function findTailscaleDevice(email) {
+  try {
+    const tailnet = process.env.TAILSCALE_TAILNET;
+    if (!tailnet) throw new Error("TAILSCALE_TAILNET not set");
+    const url = `https://api.tailscale.com/api/v2/tailnet/${encodeURIComponent(tailnet)}/devices`;
+    const res = await fetch(url, {
+      method: "GET",
+      headers: { Authorization: _tailscaleAuthHeader() },
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Tailscale devices fetch failed: ${res.status} ${text}`);
+    }
+    const json = await res.json();
+    const devices = json.devices || [];
+    const lower = (email || "").toLowerCase();
+    // find device where device.user contains the email (case-insensitive)
+    const match = devices.find((d) => {
+      if (!d.user) return false;
+      return d.user.toLowerCase().includes(lower);
+    });
+    return match || null;
+  } catch (err) {
+    console.warn("findTailscaleDevice error:", err.message);
+    return null;
+  }
+}
+
+async function enableTailscaleDevice(deviceId) {
+  try {
+    const tailnet = process.env.TAILSCALE_TAILNET;
+    if (!tailnet) throw new Error("TAILSCALE_TAILNET not set");
+    // endpoint used in your code was .../device/{id}/disable — mirror with enable
+    const url = `https://api.tailscale.com/api/v2/device/${encodeURIComponent(deviceId)}/enable`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: _tailscaleAuthHeader() },
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Tailscale enable failed: ${res.status} ${text}`);
+    }
+    return { ok: true };
+  } catch (err) {
+    console.warn("enableTailscaleDevice error:", err.message);
+    return { ok: false, error: err.message };
+  }
+}
+
+async function disableTailscaleDevice(deviceId) {
+  try {
+    const url = `https://api.tailscale.com/api/v2/device/${encodeURIComponent(deviceId)}/disable`;
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { Authorization: _tailscaleAuthHeader() },
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(`Tailscale disable failed: ${res.status} ${text}`);
+    }
+    return { ok: true };
+  } catch (err) {
+    console.warn("disableTailscaleDevice error:", err.message);
+    return { ok: false, error: err.message };
+  }
+}
+
+// High-level helpers used by your flows:
+async function enableVPNAccess(username) {
+  try {
+    // username is email
+    const device = await findTailscaleDevice(username);
+    if (!device) {
+      console.log(`No tailscale device found for ${username}`);
+      return { ok: false, reason: "no_device" };
+    }
+    const did = device.id || device.idString || device.node_id || device.key;
+    const res = await enableTailscaleDevice(did);
+    if (res.ok) {
+      console.log(`✅ Tailscale device ${did} enabled for ${username}`);
+      return { ok: true, deviceId: did };
+    } else {
+      return { ok: false, error: res.error };
+    }
+  } catch (err) {
+    console.error("enableVPNAccess error:", err.message);
+    return { ok: false, error: err.message };
+  }
+}
+
 async function disableVPNAccess(username) {
   try {
     const vpnAPI = process.env.VPN_DISABLE_ENDPOINT;
-    if (!vpnAPI) {
-      console.warn("⚠️ No VPN_DISABLE_ENDPOINT set — skipping actual disable call");
-      return { ok: false, reason: "no_endpoint" };
+    // existing external VPN disable endpoint (optional)
+    if (vpnAPI) {
+      const res = await fetch(vpnAPI, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username }),
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        console.warn(`⚠️ Failed to disable VPN for ${username} via vpnAPI: ${text}`);
+      } else {
+        console.log(`🛑 VPN access disabled via vpnAPI for ${username}`);
+      }
     }
 
-    const res = await fetch(vpnAPI, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ username }),
-    });
-
-    if (!res.ok) {
-      const text = await res.text();
-      console.warn(`⚠️ Failed to disable VPN for ${username}: ${text}`);
-      return { ok: false, status: res.status, text };
+    // Also attempt to disable Tailscale device if present
+    const device = await findTailscaleDevice(username);
+    if (device) {
+      const did = device.id || device.idString || device.node_id || device.key;
+      const r = await disableTailscaleDevice(did);
+      if (r.ok) {
+        console.log(`🛑 Tailscale device ${did} disabled for ${username}`);
+      } else {
+        console.warn("Tailscale disable error:", r.error);
+      }
+    } else {
+      console.log(`No Tailscale device found for ${username} to disable.`);
     }
 
-    console.log(`🛑 VPN access disabled for ${username}`);
     return { ok: true };
   } catch (err) {
     console.error("disableVPNAccess error:", err.message);
@@ -192,12 +306,26 @@ app.post(
         `✅ ${email} purchased ${plan.name} — total ${totalLimit}MB (after rollover if any)`
       );
 
-// 📨 Send notification to Firestore
-await sendUserNotification(
-  email,
-  "plan_purchased",
-  `🎉 You’ve successfully purchased the ${plan.name}. Total: ${totalLimit}MB.`
-);
+      // 📨 Send notification to Firestore
+      await sendUserNotification(
+        email,
+        "plan_purchased",
+        `🎉 You’ve successfully purchased the ${plan.name}. Total: ${totalLimit}MB.`
+      );
+
+      // ---- NEW: try to enable Tailscale device for user (if one exists) ----
+      try {
+        const enableRes = await enableVPNAccess(email);
+        if (enableRes.ok && enableRes.deviceId) {
+          // store device id on user doc for later reference
+          await userRef.update({ vpnDeviceId: enableRes.deviceId });
+          console.log(`Saved vpnDeviceId=${enableRes.deviceId} to user ${email}`);
+        } else {
+          console.log("Tailscale enable returned:", enableRes);
+        }
+      } catch (err) {
+        console.warn("Error enabling tailscale device after purchase:", err.message);
+      }
 
       res.sendStatus(200);
     } catch (err) {
@@ -207,12 +335,11 @@ await sendUserNotification(
   }
 );
 
-
 // --- Enable JSON parsing + add request logger middleware ---
 app.use(express.json());
 app.use(cors());
 
-// 🪵 Universal request logger — this is the new part
+// Universal request logger
 app.use((req, res, next) => {
   console.log(`➡️  ${req.method} ${req.originalUrl}`);
   next();
@@ -262,6 +389,20 @@ app.post("/vpn/session/connect", async (req, res) => {
       lastConnect: new Date().toISOString(),
     });
 
+    // optional: ensure tailscale device enabled when user connects
+    try {
+      const user = snap.docs[0].data();
+      if (user && !user.vpnDeviceId) {
+        // attempt to find / enable mapping if vpnDeviceId not set
+        const r = await enableVPNAccess(username);
+        if (r.ok && r.deviceId) {
+          await snap.docs[0].ref.update({ vpnDeviceId: r.deviceId });
+        }
+      }
+    } catch (err) {
+      console.warn("connect: tailscale enable attempt failed:", err.message);
+    }
+
     res.json({ success: true });
   } catch (err) {
     console.error("Connect error:", err.message);
@@ -289,6 +430,7 @@ app.post("/vpn/session/disconnect", async (req, res) => {
     });
 
     if (over || expired) {
+      // disable both local VPN and tailscale device
       await disableVPNAccess(username);
       await sendUserNotification(
         username,
@@ -353,6 +495,30 @@ app.post("/vpn/session/update-usage", async (req, res) => {
 });
 
 // ----------------------
+// Tailscale manual endpoint (testing / admin use)
+// ----------------------
+app.post("/tailscale/enable-user", async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ error: "email required" });
+    const r = await enableVPNAccess(email);
+    if (r.ok) {
+      // try to update user doc with device id
+      const snap = await db.collection("users").where("email", "==", email).limit(1).get();
+      if (!snap.empty && r.deviceId) {
+        await snap.docs[0].ref.update({ vpnDeviceId: r.deviceId, vpnActive: true });
+      }
+      return res.json({ success: true, deviceId: r.deviceId || null });
+    } else {
+      return res.status(500).json({ success: false, error: r.error || r.reason });
+    }
+  } catch (err) {
+    console.error("/tailscale/enable-user error:", err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ----------------------
 // CRON JOBS
 // ----------------------
 app.all("/cron/expire-check", async (_, res) => {
@@ -393,7 +559,7 @@ app.get("/cron/tailscale-sync", async (_, res) => {
       `https://api.tailscale.com/api/v2/tailnet/${encodeURIComponent(
         tailnet
       )}/devices`,
-      { headers: { Authorization: `Bearer ${apiKey}` } }
+      { headers: { Authorization: _tailscaleAuthHeader() } }
     );
 
     if (!response.ok) throw new Error(`Tailscale API error ${response.status}`);
@@ -417,7 +583,7 @@ app.get("/cron/tailscale-sync", async (_, res) => {
         if (match) {
           await fetch(
             `https://api.tailscale.com/api/v2/device/${match.id}/disable`,
-            { method: "POST", headers: { Authorization: `Bearer ${apiKey}` } }
+            { method: "POST", headers: { Authorization: _tailscaleAuthHeader() } }
           );
           disabled++;
         }
