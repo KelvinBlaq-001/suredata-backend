@@ -35,8 +35,6 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 
 // --- Lightweight admin middleware ---
-// If ADMIN_API_KEY is set, endpoints that mutate node assignments will require header x-admin-key.
-// If ADMIN_API_KEY is NOT set, endpoints still work (dev/test convenience) but server logs a warning.
 const adminApiKey = process.env.ADMIN_API_KEY || null;
 if (!adminApiKey) {
   console.warn("⚠️ ADMIN_API_KEY not set — node admin endpoints will be accessible without admin key. Set ADMIN_API_KEY to secure them.");
@@ -50,7 +48,7 @@ function requireAdmin(req, res, next) {
   return next();
 }
 
-// --- Notification Helper (FCM-ready stub) ---
+// --- Notification Helper ---
 async function sendUserNotification(email, type, message) {
   try {
     console.log(`🔔 Notification [${type}] → ${email}: ${message}`);
@@ -58,7 +56,7 @@ async function sendUserNotification(email, type, message) {
       email,
       type,
       message,
-      timestamp: admin.firestore.FieldValue.serverTimestamp(), // Proper Firestore Timestamp
+      timestamp: admin.firestore.FieldValue.serverTimestamp(),
       read: false,
     });
   } catch (err) {
@@ -67,20 +65,21 @@ async function sendUserNotification(email, type, message) {
 }
 
 // ----------------------
-// TAILSCALE HELPERS
+// TAILSCALE HELPERS (updated with TAILSCALE_API_BASE)
 // ----------------------
-// Requires: TAILSCALE_API_KEY and TAILSCALE_TAILNET in env
 function _tailscaleAuthHeader() {
   const apiKey = process.env.TAILSCALE_API_KEY || "";
   const token = Buffer.from(`${apiKey}:`).toString("base64");
   return `Basic ${token}`;
 }
 
+const BASE_URL = process.env.TAILSCALE_API_BASE || "https://api.tailscale.com/api/v2";
+
 async function tailscaleListDevices() {
   try {
     const tailnet = process.env.TAILSCALE_TAILNET;
     if (!tailnet) throw new Error("TAILSCALE_TAILNET not set");
-    const url = `https://api.tailscale.com/api/v2/tailnet/${encodeURIComponent(tailnet)}/devices`;
+    const url = `${BASE_URL}/tailnet/${encodeURIComponent(tailnet)}/devices`;
     const res = await fetch(url, { method: "GET", headers: { Authorization: _tailscaleAuthHeader() } });
     if (!res.ok) {
       const text = await res.text();
@@ -96,7 +95,7 @@ async function tailscaleListDevices() {
 
 async function tailscaleEnableDevice(deviceId) {
   try {
-    const url = `https://api.tailscale.com/api/v2/device/${encodeURIComponent(deviceId)}/enable`;
+    const url = `${BASE_URL}/device/${encodeURIComponent(deviceId)}/enable`;
     const res = await fetch(url, { method: "POST", headers: { Authorization: _tailscaleAuthHeader() } });
     if (!res.ok) {
       const text = await res.text();
@@ -111,7 +110,7 @@ async function tailscaleEnableDevice(deviceId) {
 
 async function tailscaleDisableDevice(deviceId) {
   try {
-    const url = `https://api.tailscale.com/api/v2/device/${encodeURIComponent(deviceId)}/disable`;
+    const url = `${BASE_URL}/device/${encodeURIComponent(deviceId)}/disable`;
     const res = await fetch(url, { method: "POST", headers: { Authorization: _tailscaleAuthHeader() } });
     if (!res.ok) {
       const text = await res.text();
@@ -123,6 +122,13 @@ async function tailscaleDisableDevice(deviceId) {
     return { ok: false, error: err.message };
   }
 }
+
+// ----------------------
+// (rest of your code remains EXACTLY as-is)
+// ----------------------
+
+// 🔹 everything below this line is unchanged
+
 
 // ----------------------
 // Node management helpers (Firestore: tailscale_nodes)
