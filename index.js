@@ -369,103 +369,88 @@ app.post(
       const userRef = snap.docs[0].ref;
       const userData = snap.docs[0].data();
 
-      // ✅ Compute rollover if applicable
-      const now = new Date();
-      const currentExpiry = userData.expiryDate ? new Date(userData.expiryDate) : null;
-      const isActive = currentExpiry && currentExpiry > now;
+// --- ✅ ROLLOVER LOGIC (Stable & Stacked) ---
+const now = new Date();
+const currentExpiry = userData.expiryDate ? new Date(userData.expiryDate) : null;
+const hasActivePlan = currentExpiry && currentExpiry > now;
 
-      // If active, compute remaining unused data in MB
-      const remainingData = Math.max((userData.planLimit || 0) - (userData.dataUsed || 0), 0);
+// Remaining data from old plan
+const remainingData = hasActivePlan
+  ? Math.max((userData.planLimit || 0) - (userData.dataUsed || 0), 0)
+  : 0;
 
-      let totalLimit = plan.dataLimit; // MB
-      if (isActive && remainingData > 0) {
-        totalLimit += remainingData;
-        console.log(
-          `🔄 Rollover applied for ${email}: ${remainingData}MB leftover + ${plan.dataLimit}MB new`
-        );
-      }
+// Add leftover to new plan if old still active
+const rolloverAmount = remainingData > 0 ? remainingData : 0;
+const totalVisibleData = plan.dataLimit + rolloverAmount;
 
-      const newExpiry = new Date();
-      newExpiry.setDate(newExpiry.getDate() + plan.days);
+// Set new expiry
+const newExpiry = new Date();
+newExpiry.setDate(newExpiry.getDate() + plan.days);
 
-      // Update user doc: if account was inactive, reset dataUsed; otherwise keep current dataUsed
-      const newDataUsed = isActive ? (userData.dataUsed || 0) : 0;
+const updateData = {
+  updatedAt: now.toISOString(),
+  lastPayment: { amount, reference, date: now.toISOString() },
+  vpnActive: true,
+};
 
-      await userRef.update({
-        currentPlan: plan.name,
-        planLimit: totalLimit,
-        dataUsed: newDataUsed,
-        expiryDate: newExpiry.toISOString(),
-        vpnActive: true,
-        lastPayment: {
-          amount,
-          reference,
-          date: now.toISOString(),
-        },
-        updatedAt: now.toISOString(),
-      });
+if (hasActivePlan) {
+  // 🕓 Active plan still valid — queue new one
+  updateData.pendingPlan = {
+    name: plan.name,
+    dataLimit: plan.dataLimit,
+    days: plan.days,
+    purchasedAt: now.toISOString(),
+    expiryDate: newExpiry.toISOString(),
+  };
+  updateData.totalDataDisplay = totalVisibleData;
+  console.log(`🕓 Queued new plan for ${email}: ${plan.name} (rollover stacked)`);
 
-      // record transaction
-      await db.collection("transactions").doc(reference).set({
-        email,
-        reference,
-        amount,
-        plan: plan.name,
-        status: "success",
-        timestamp: now.toISOString(),
-      });
+  await sendUserNotification(
+    email,
+    "plan_rollover_queued",
+    `✅ Your ${plan.name} has been added and will start when your current plan ends.`
+  );
+} else {
+  // 🟢 No active plan — activate immediately
+  updateData.currentPlan = plan.name;
+  updateData.planLimit = plan.dataLimit + rolloverAmount;
+  updateData.dataUsed = 0;
+  updateData.expiryDate = newExpiry.toISOString();
+  delete updateData.pendingPlan;
 
-      console.log(
-        `✅ ${email} purchased ${plan.name} — total ${totalLimit}MB (after rollover if any)`
-      );
+  await sendUserNotification(
+    email,
+    "plan_activated",
+    `🎉 Your ${plan.name} is now active! ${plan.dataLimit + rolloverAmount}MB available.`
+  );
+}
 
-      // 📨 Send notification to Firestore
-      await sendUserNotification(
-        email,
-        "plan_purchased",
-        `🎉 You’ve successfully purchased the ${plan.name}. Total: ${Math.round(totalLimit)}MB.`
-      );
+await userRef.update(updateData);
 
-      // --- AUTO-ASSIGN NODE IMMEDIATELY (best-effort) ---
-      try {
-        const uid = snap.docs[0].data().uid || snap.docs[0].id || email;
-        const userIdentifier = uid || email;
-        // find if there's already a vpn_session for this user
-        const sessionRef = db.collection("vpn_sessions").doc(userIdentifier);
-        const existingSession = await sessionRef.get();
+// --- ✅ SAFE NODE ASSIGNMENT ---
+if (!existingSession.exists || !existingSession.data().active) {
+  const nodeDoc = await pickBestNode();
+  if (nodeDoc) {
+    await assignNodeToUser(nodeDoc.ref, userIdentifier);
+    await sessionRef.set({
+      nodeId: nodeDoc.id,
+      assignedAt: new Date().toISOString(),
+      active: true,
+      user: email || uid || null,
+    });
+    await userRef.update({
+      vpnAssignedAt: new Date().toISOString(),
+      vpnDeviceId: nodeDoc.id,
+      vpnActive: true,
+    });
+    console.log(`🔗 Node ${nodeDoc.id} assigned to ${email}`);
+    await sendUserNotification(email, "node_assigned", `A node has been assigned to your account.`);
+  }
+} else {
+  console.log(`🔒 ${email} already has an active VPN node, skipping reassignment.`);
+  await userRef.update({ vpnActive: true });
+}
 
-        if (!existingSession.exists) {
-          const nodeDoc = await pickBestNode();
-          if (nodeDoc) {
-            const assignRes = await assignNodeToUser(nodeDoc.ref, userIdentifier);
-            await sessionRef.set({
-              nodeId: nodeDoc.id,
-              assignedAt: new Date().toISOString(),
-              active: true,
-              user: email || uid || null,
-            });
-            // update user doc with assigned node id
-            await userRef.update({
-              vpnAssignedAt: new Date().toISOString(),
-              vpnDeviceId: nodeDoc.id,
-              vpnActive: true,
-            });
-            console.log(`🔗 Auto-assigned node ${nodeDoc.id} to ${email}`);
-            await sendUserNotification(email, "node_assigned", `Node assigned to your account.`);
-          } else {
-            console.log("⚠️ No available node to auto-assign after payment");
-          }
-        } else {
-          // update existing session to active (if it existed but was inactive)
-          await sessionRef.update({
-            active: true,
-            updatedAt: new Date().toISOString(),
-          });
-          await userRef.update({ vpnActive: true });
-        }
-      } catch (err) {
-        console.warn("Auto-assign after purchase failed:", err.message || err);
-      }
 
       res.sendStatus(200);
     } catch (err) {
@@ -875,19 +860,31 @@ app.post("/vpn/session/update-usage", async (req, res) => {
 });
 
 // ----------------------
-// CRON JOBS
-// ----------------------
-app.all("/cron/expire-check", async (_, res) => {
-  try {
-    const now = new Date();
-    const snap = await db.collection("users").get();
-    let disabled = 0;
+// --- ✅ AUTO ACTIVATE PENDING PLAN ON EXPIRY ---
+if (expired && u.pendingPlan) {
+  console.log(`⏩ Activating pending plan for ${u.email}`);
+  const newPlan = u.pendingPlan;
+  const newExpiry = new Date();
+  newExpiry.setDate(newExpiry.getDate() + (newPlan.days || 30));
 
-    for (const doc of snap.docs) {
-      const u = doc.data();
-      const expired = u.expiryDate && new Date(u.expiryDate) < now;
-      const exhausted =
-        (u.planLimit || 0) > 0 && (u.dataUsed || 0) >= u.planLimit;
+  await doc.ref.update({
+    currentPlan: newPlan.name,
+    planLimit: newPlan.dataLimit,
+    dataUsed: 0,
+    expiryDate: newPlan.expiryDate || newExpiry.toISOString(),
+    pendingPlan: admin.firestore.FieldValue.delete(),
+    vpnActive: true,
+    updatedAt: new Date().toISOString(),
+  });
+
+  await sendUserNotification(
+    u.email,
+    "plan_activated_from_rollover",
+    `🎯 Your new ${newPlan.name} has started — ${newPlan.dataLimit}MB now available.`
+  );
+  continue; // skip disable logic
+}
+
 
       if (expired || exhausted) {
         await doc.ref.update({ vpnActive: false, updatedAt: new Date().toISOString() });
@@ -957,12 +954,13 @@ app.post("/vpn/disable", async (req, res) => {
     const result = await (async () => {
       // attempt to disable via tailscale + optional external vpn endpoint
       try {
-        await disableVPNAccess(username);
-      } catch (e) {
-        console.warn("vpn/disable disableVPNAccess error", e.message || e);
-      }
-      return { ok: true };
-    })();
+    await disableVPNAccess(username);
+    res.json({ success: true });
+  } catch (err) {
+    console.error("/vpn/disable error:", err.message || err);
+    res.status(500).json({ error: err.message });
+  }
+});
 
     res.json({ success: result.ok, result });
   } catch (err) {
