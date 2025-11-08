@@ -861,44 +861,65 @@ app.post("/vpn/session/update-usage", async (req, res) => {
 
 // ----------------------
 // --- ✅ AUTO ACTIVATE PENDING PLAN ON EXPIRY ---
-for (const doc of usersSnapshot.docs) {
-  const u = doc.data();
-  const expired = new Date(u.expiryDate) <= new Date();
+app.get("/cron/expire-check", async (req, res) => {
+  try {
+    console.log("⏰ Checking expired users...");
 
-  if (expired && u.pendingPlan) {
-    console.log(`⏩ Activating pending plan for ${u.email}`);
-    const newPlan = u.pendingPlan;
-    const newExpiry = new Date();
-    newExpiry.setDate(newExpiry.getDate() + (newPlan.days || 30));
+    const usersSnapshot = await admin.firestore().collection("users").get();
+    let disabled = 0;
+    let renewed = 0;
 
-    await doc.ref.update({
-      currentPlan: newPlan.name,
-      planLimit: newPlan.dataLimit,
-      dataUsed: 0,
-      expiryDate: newPlan.expiryDate || newExpiry.toISOString(),
-      pendingPlan: admin.firestore.FieldValue.delete(),
-      vpnActive: true,
-      updatedAt: new Date().toISOString(),
+    for (const doc of usersSnapshot.docs) {
+      const u = doc.data();
+      const expired = new Date(u.expiryDate) <= new Date();
+
+      // ✅ Handle rollover / pending plan activation
+      if (expired && u.pendingPlan) {
+        console.log(`⏩ Activating pending plan for ${u.email}`);
+        const newPlan = u.pendingPlan;
+        const newExpiry = new Date();
+        newExpiry.setDate(newExpiry.getDate() + (newPlan.days || 30));
+
+        await doc.ref.update({
+          currentPlan: newPlan.name,
+          planLimit: newPlan.dataLimit,
+          dataUsed: 0,
+          expiryDate: newPlan.expiryDate || newExpiry.toISOString(),
+          pendingPlan: admin.firestore.FieldValue.delete(),
+          vpnActive: true,
+          updatedAt: new Date().toISOString(),
+        });
+
+        await sendUserNotification(
+          u.email,
+          "plan_activated_from_rollover",
+          `🎯 Your new ${newPlan.name} has started! ${newPlan.dataLimit}MB now available.`
+        );
+
+        renewed++;
+      }
+
+      // ✅ Handle expired with no pending plan
+      if (expired && !u.pendingPlan) {
+        console.log(`🚫 Expired user: ${u.email}`);
+        disabled++;
+
+        await disableVPNAccess(u.email);
+        await doc.ref.update({
+          vpnActive: false,
+          updatedAt: new Date().toISOString(),
+        });
+      }
+    }
+
+    res.json({
+      message: `✅ Expire check done: ${disabled} disabled, ${renewed} renewed.`,
     });
-
-    await sendUserNotification(
-      u.email,
-      "plan_activated_from_rollover",
-      `🎯 Your new ${newPlan.name} has started! ${newPlan.dataLimit}MB now available.`
-    );
-
-    // ✅ removed "continue;" — loop naturally goes to next user
+  } catch (err) {
+    console.error("❌ Expire check error:", err);
+    res.status(500).json({ error: err.message });
   }
-
-  if (expired && !u.pendingPlan) {
-    disabled++;
-    await disableVPNAccess(u.email);
-    await doc.ref.update({
-      vpnActive: false,
-      updatedAt: new Date().toISOString(),
-    });
-  }
-} // ✅ closes for-loop properly
+});
 
 
 // Periodic tailscale-sync (keeps tailscale_nodes updated). you can call this endpoint via scheduler
