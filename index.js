@@ -1017,28 +1017,20 @@ app.post("/notify/test", async (req, res) => {
   }
 });
 
-// disable a username (admin / internal)
+// Disable user's VPN (clean, synchronous handler)
 app.post("/vpn/disable", async (req, res) => {
   try {
     const { username } = req.body;
     if (!username) return res.status(400).json({ error: "username required" });
 
-    try {
-      await disableVPNAccess(username);
-      return res.json({ success: true });
-    } catch (err) {
-      console.error("/vpn/disable error:", err.message || err);
-      return res.status(500).json({ error: err.message || String(err) });
-    }
-  } catch (err) {
-    console.error("/vpn/disable outer error:", err);
-    return res.status(500).json({ error: err.message || String(err) });
-  }
-});
+    // Attempt to disable access (this function already handles tailscale/session cleanup)
+    await disableVPNAccess(username);
 
-    res.json({ success: result.ok, result });
-    catch (err) {
-    res.status(500).json({ error: err.message });
+    // Always respond after disableVPNAccess completes (or throws)
+    return res.json({ success: true });
+  } catch (err) {
+    console.error("/vpn/disable error:", err?.message || err);
+    return res.status(500).json({ error: err?.message || String(err) });
   }
 });
 
