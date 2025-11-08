@@ -649,6 +649,18 @@ app.post("/vpn/node/auto-assign", requireAdmin, async (req, res) => {
 // Request: { email or uid }
 app.post("/vpn/node/revoke", requireAdmin, async (req, res) => {
   try {
+    // audit log (do NOT log full request bodies in production if they contain secrets)
+    console.log("/vpn/node/revoke called", {
+      authKeyPresent: !!req.headers["x-admin-key"],
+      ip: req.ip || req.headers["x-forwarded-for"] || null,
+      bodyPreview: {
+        // only show identifying fields, avoid logging tokens/keys
+        email: req.body?.email || null,
+        uid: req.body?.uid || null,
+      },
+      time: new Date().toISOString(),
+    });
+
     const { email, uid } = req.body;
     const userIdentifier = (uid || email);
     if (!userIdentifier) return res.status(400).json({ error: "email or uid required" });
@@ -659,6 +671,7 @@ app.post("/vpn/node/revoke", requireAdmin, async (req, res) => {
 
     const session = sessionSnap.data() || {};
     const nodeId = session.nodeId;
+
     if (nodeId) {
       const nodeRef = db.collection("tailscale_nodes").doc(nodeId);
       // attempt to disable device at Tailscale as well (best-effort)
@@ -666,9 +679,17 @@ app.post("/vpn/node/revoke", requireAdmin, async (req, res) => {
         const tailscaleRes = await tailscaleDisableDevice(nodeId);
         console.log("tailscaleDisableDevice result:", tailscaleRes);
       } catch (err) {
-        console.warn("tailscaleDisableDevice failed:", err.message || err);
+        console.warn("tailscaleDisableDevice failed:", err?.message || err);
       }
-      await releaseNode(nodeRef);
+
+      try {
+        await releaseNode(nodeRef);
+        console.log(`Released node ${nodeId} in Firestore for ${userIdentifier}`);
+      } catch (err) {
+        console.warn("releaseNode failed:", err?.message || err);
+      }
+    } else {
+      console.log(`No nodeId found in session for ${userIdentifier} — nothing to release`);
     }
 
     // mark session inactive
@@ -687,15 +708,17 @@ app.post("/vpn/node/revoke", requireAdmin, async (req, res) => {
       }
       if (userDocSnap && userDocSnap.exists) {
         await userDocSnap.ref.update({ vpnActive: false, revokedAt: new Date().toISOString() });
+      } else {
+        console.warn("User doc not found while revoking for", userIdentifier);
       }
     } catch (e) {
-      console.warn("Failed to update user doc during revoke:", e.message || e);
+      console.warn("Failed to update user doc during revoke:", e?.message || e);
     }
 
     res.json({ success: true, revoked: true, nodeId: nodeId || null });
   } catch (err) {
-    console.error("/vpn/node/revoke error:", err.message || err);
-    res.status(500).json({ error: err.message });
+    console.error("/vpn/node/revoke error:", err?.message || err);
+    res.status(500).json({ error: err?.message || String(err) });
   }
 });
 
@@ -893,26 +916,28 @@ app.get("/cron/expire-check", async (req, res) => {
   try {
     console.log("⏰ Checking expired users...");
 
-    const usersSnapshot = await admin.firestore().collection("users").get();
+    const usersSnapshot = await db.collection("users").get();
     let disabled = 0;
     let renewed = 0;
+    const now = new Date();
 
     for (const doc of usersSnapshot.docs) {
       const u = doc.data();
-      const expired = new Date(u.expiryDate) <= new Date();
+      const expiryDate = u.expiryDate ? new Date(u.expiryDate) : null;
+      const expired = expiryDate ? expiryDate <= now : false;
 
-      // ✅ Handle rollover / pending plan activation
+      // Auto-activate pending plan if expired and pendingPlan exists
       if (expired && u.pendingPlan) {
         console.log(`⏩ Activating pending plan for ${u.email}`);
         const newPlan = u.pendingPlan;
-        const newExpiry = new Date();
-        newExpiry.setDate(newExpiry.getDate() + (newPlan.days || 30));
+        const newExpiry = newPlan.expiryDate ? new Date(newPlan.expiryDate) : new Date();
+        if (!newPlan.expiryDate) newExpiry.setDate(newExpiry.getDate() + (newPlan.days || 30));
 
         await doc.ref.update({
           currentPlan: newPlan.name,
           planLimit: newPlan.dataLimit,
           dataUsed: 0,
-          expiryDate: newPlan.expiryDate || newExpiry.toISOString(),
+          expiryDate: newExpiry.toISOString(),
           pendingPlan: admin.firestore.FieldValue.delete(),
           vpnActive: true,
           updatedAt: new Date().toISOString(),
@@ -925,29 +950,25 @@ app.get("/cron/expire-check", async (req, res) => {
         );
 
         renewed++;
+        continue; // done with this user — skip further disable logic
       }
 
-      // ✅ Handle expired with no pending plan
+      // If expired and no pending plan -> disable
       if (expired && !u.pendingPlan) {
         console.log(`🚫 Expired user: ${u.email}`);
+        await disableVPNAccess(u.email || u.username || doc.id);
+        await doc.ref.update({ vpnActive: false, updatedAt: new Date().toISOString() });
         disabled++;
-
-        await disableVPNAccess(u.email);
-        await doc.ref.update({
-          vpnActive: false,
-          updatedAt: new Date().toISOString(),
-        });
       }
     }
 
-    res.json({
-      message: `✅ Expire check done: ${disabled} disabled, ${renewed} renewed.`,
-    });
+    res.json({ message: `✅ Expire check done: ${disabled} disabled, ${renewed} renewed.` });
   } catch (err) {
     console.error("❌ Expire check error:", err);
-    res.status(500).json({ error: err.message });
+    res.status(500).json({ error: err.message || String(err) });
   }
 });
+
 
 
 // Periodic tailscale-sync (keeps tailscale_nodes updated). you can call this endpoint via scheduler
@@ -996,19 +1017,22 @@ app.post("/notify/test", async (req, res) => {
   }
 });
 
+// disable a username (admin / internal)
 app.post("/vpn/disable", async (req, res) => {
   try {
     const { username } = req.body;
     if (!username) return res.status(400).json({ error: "username required" });
 
-    const result = await (async () => {
-      // attempt to disable via tailscale + optional external vpn endpoint
-      try {
-    await disableVPNAccess(username);
-    res.json({ success: true });
+    try {
+      await disableVPNAccess(username);
+      return res.json({ success: true });
+    } catch (err) {
+      console.error("/vpn/disable error:", err.message || err);
+      return res.status(500).json({ error: err.message || String(err) });
+    }
   } catch (err) {
-    console.error("/vpn/disable error:", err.message || err);
-    res.status(500).json({ error: err.message });
+    console.error("/vpn/disable outer error:", err);
+    return res.status(500).json({ error: err.message || String(err) });
   }
 });
 
