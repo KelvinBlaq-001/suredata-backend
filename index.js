@@ -285,14 +285,14 @@ async function setNodeOnline(nodeDocRef, online) {
 }
 
 // ----------------------------
-// PAYSTACK WEBHOOK (updated with correct plans + rollover + auto-assign)
+// PAYSTACK WEBHOOK (updated with correct plans + rollover + safe auto-assign)
 // ----------------------------
 app.post(
   "/payments/webhook",
   express.raw({ type: "application/json" }),
   async (req, res) => {
     try {
-      const secret = process.env.PAYSTACK_SECRET_KEY; // ✅ fixed variable name
+      const secret = process.env.PAYSTACK_SECRET_KEY;
       if (!secret) {
         console.error("❌ PAYSTACK_SECRET_KEY missing in .env");
         return res.status(500).send("Server misconfigured");
@@ -309,11 +309,8 @@ app.post(
 
       const receivedHash = req.headers["x-paystack-signature"];
 
-      // ✅ Allow easy testing
-      if (
-        process.env.NODE_ENV !== "production" &&
-        receivedHash === "test-bypass"
-      ) {
+      // Allow easy testing locally
+      if (process.env.NODE_ENV !== "production" && receivedHash === "test-bypass") {
         console.log("🧪 Paystack test-bypass active");
       } else if (computedHash !== receivedHash) {
         console.log("⚠️ Invalid Paystack signature");
@@ -328,17 +325,16 @@ app.post(
       const amount = data.amount / 100; // amount in Naira
       const email = (data.customer?.email || "").toLowerCase();
 
-      // ✅ Match plan by amount (your specified plans)
+      // Match plan by amount (MB)
       const plans = {
-        500: { name: "Basic Plan", dataLimit: 1 * 1024, days: 30 },   // 1 GB => 1024 MB
-        1000: { name: "Standard Plan", dataLimit: 3 * 1024, days: 30 }, // 3 GB
-        2000: { name: "Pro Plan", dataLimit: 8 * 1024, days: 30 },     // 8 GB
-        5000: { name: "Ultra Plan", dataLimit: 20 * 1024, days: 30 },  // 20 GB
+        500: { name: "Basic Plan", dataLimit: 1 * 1024, days: 30 },
+        1000: { name: "Standard Plan", dataLimit: 3 * 1024, days: 30 },
+        2000: { name: "Pro Plan", dataLimit: 8 * 1024, days: 30 },
+        5000: { name: "Ultra Plan", dataLimit: 20 * 1024, days: 30 },
       };
       const plan = plans[amount];
       if (!plan) {
         console.log(`Unhandled payment amount: ${amount} for ${email}`);
-        // still record transaction and return OK
         await db.collection("transactions").doc(reference).set({
           email,
           reference,
@@ -350,7 +346,7 @@ app.post(
         return res.sendStatus(200);
       }
 
-      // ✅ Find user
+      // Find user
       const usersRef = db.collection("users");
       const snap = await usersRef.where("email", "==", email).limit(1).get();
       if (snap.empty) {
@@ -366,99 +362,131 @@ app.post(
         return res.sendStatus(200);
       }
 
-      const userRef = snap.docs[0].ref;
-      const userData = snap.docs[0].data();
+      const userDoc = snap.docs[0];
+      const userRef = userDoc.ref;
+      const userData = userDoc.data();
 
-// --- ✅ ROLLOVER LOGIC (Stable & Stacked) ---
-const now = new Date();
-const currentExpiry = userData.expiryDate ? new Date(userData.expiryDate) : null;
-const hasActivePlan = currentExpiry && currentExpiry > now;
+      // --- ROLLOVER LOGIC (Stable & Stacked) ---
+      const now = new Date();
+      const currentExpiry = userData.expiryDate ? new Date(userData.expiryDate) : null;
+      const hasActivePlan = currentExpiry && currentExpiry > now;
 
-// Remaining data from old plan
-const remainingData = hasActivePlan
-  ? Math.max((userData.planLimit || 0) - (userData.dataUsed || 0), 0)
-  : 0;
+      // Remaining data from old plan (in MB)
+      const remainingData = hasActivePlan
+        ? Math.max((userData.planLimit || 0) - (userData.dataUsed || 0), 0)
+        : 0;
 
-// Add leftover to new plan if old still active
-const rolloverAmount = remainingData > 0 ? remainingData : 0;
-const totalVisibleData = plan.dataLimit + rolloverAmount;
+      const rolloverAmount = remainingData > 0 ? remainingData : 0;
+      const totalVisibleData = plan.dataLimit + rolloverAmount;
 
-// Set new expiry
-const newExpiry = new Date();
-newExpiry.setDate(newExpiry.getDate() + plan.days);
+      // pre-calc expiry for the new plan
+      const newExpiry = new Date();
+      newExpiry.setDate(newExpiry.getDate() + plan.days);
 
-const updateData = {
-  updatedAt: now.toISOString(),
-  lastPayment: { amount, reference, date: now.toISOString() },
-  vpnActive: true,
-};
+      // Build update object
+      const updateData = {
+        updatedAt: now.toISOString(),
+        lastPayment: { amount, reference, date: now.toISOString() },
+        vpnActive: true,
+      };
 
-if (hasActivePlan) {
-  // 🕓 Active plan still valid — queue new one
-  updateData.pendingPlan = {
-    name: plan.name,
-    dataLimit: plan.dataLimit,
-    days: plan.days,
-    purchasedAt: now.toISOString(),
-    expiryDate: newExpiry.toISOString(),
-  };
-  updateData.totalDataDisplay = totalVisibleData;
-  console.log(`🕓 Queued new plan for ${email}: ${plan.name} (rollover stacked)`);
+      if (hasActivePlan) {
+        // queue new plan in pendingPlan
+        updateData.pendingPlan = {
+          name: plan.name,
+          dataLimit: plan.dataLimit,
+          days: plan.days,
+          purchasedAt: now.toISOString(),
+          expiryDate: newExpiry.toISOString(),
+        };
+        updateData.totalDataDisplay = totalVisibleData;
 
-  await sendUserNotification(
-    email,
-    "plan_rollover_queued",
-    `✅ Your ${plan.name} has been added and will start when your current plan ends.`
-  );
-} else {
-  // 🟢 No active plan — activate immediately
-  updateData.currentPlan = plan.name;
-  updateData.planLimit = plan.dataLimit + rolloverAmount;
-  updateData.dataUsed = 0;
-  updateData.expiryDate = newExpiry.toISOString();
-  delete updateData.pendingPlan;
+        console.log(`🕓 Queued new plan for ${email}: ${plan.name} (rollover stacked)`);
+        await sendUserNotification(
+          email,
+          "plan_rollover_queued",
+          `✅ Your ${plan.name} has been added and will start when your current plan ends.`
+        );
+      } else {
+        // activate immediately (no active plan)
+        updateData.currentPlan = plan.name;
+        updateData.planLimit = plan.dataLimit + rolloverAmount;
+        updateData.dataUsed = 0;
+        updateData.expiryDate = newExpiry.toISOString();
+        updateData.pendingPlan = admin.firestore.FieldValue.delete();
 
-  await sendUserNotification(
-    email,
-    "plan_activated",
-    `🎉 Your ${plan.name} is now active! ${plan.dataLimit + rolloverAmount}MB available.`
-  );
-}
+        console.log(`🟢 Activating ${plan.name} immediately for ${email}`);
+        await sendUserNotification(
+          email,
+          "plan_activated",
+          `🎉 Your ${plan.name} is now active! ${plan.dataLimit + rolloverAmount}MB available.`
+        );
+      }
 
-await userRef.update(updateData);
+      // Save transaction record
+      await db.collection("transactions").doc(reference).set({
+        email,
+        reference,
+        amount,
+        plan: plan.name,
+        status: "success",
+        timestamp: now.toISOString(),
+      });
 
-// --- ✅ SAFE NODE ASSIGNMENT ---
-if (!existingSession.exists || !existingSession.data().active) {
-  const nodeDoc = await pickBestNode();
-  if (nodeDoc) {
-    await assignNodeToUser(nodeDoc.ref, userIdentifier);
-    await sessionRef.set({
-      nodeId: nodeDoc.id,
-      assignedAt: new Date().toISOString(),
-      active: true,
-      user: email || uid || null,
-    });
-    await userRef.update({
-      vpnAssignedAt: new Date().toISOString(),
-      vpnDeviceId: nodeDoc.id,
-      vpnActive: true,
-    });
-    console.log(`🔗 Node ${nodeDoc.id} assigned to ${email}`);
-    await sendUserNotification(email, "node_assigned", `A node has been assigned to your account.`);
-  }
-} else {
-  console.log(`🔒 ${email} already has an active VPN node, skipping reassignment.`);
-  await userRef.update({ vpnActive: true });
-}
+      // Update user doc with plan/pending info
+      await userRef.update(updateData);
 
+      // --- SAFE NODE ASSIGNMENT (non-blocking) ---
+      // Prepare identifiers & session ref *before* trying to use them
+      const uid = (userData.uid || userDoc.id || email);
+      const userIdentifier = uid || email;
+      const sessionRef = db.collection("vpn_sessions").doc(userIdentifier);
+      let existingSession = null;
+      try {
+        existingSession = await sessionRef.get(); // snapshot
+      } catch (e) {
+        console.warn("Failed to read vpn_sessions for", userIdentifier, e.message || e);
+        existingSession = null;
+      }
 
-      res.sendStatus(200);
+      try {
+        if (!existingSession || !existingSession.exists || !existingSession.data().active) {
+          const nodeDoc = await pickBestNode();
+          if (nodeDoc) {
+            await assignNodeToUser(nodeDoc.ref, userIdentifier);
+            await sessionRef.set({
+              nodeId: nodeDoc.id,
+              assignedAt: new Date().toISOString(),
+              active: true,
+              user: email || uid || null,
+            });
+            await userRef.update({
+              vpnAssignedAt: new Date().toISOString(),
+              vpnDeviceId: nodeDoc.id,
+              vpnActive: true,
+            });
+            console.log(`🔗 Node ${nodeDoc.id} assigned to ${email}`);
+            await sendUserNotification(email, "node_assigned", "A node has been assigned to your account.");
+          } else {
+            console.log("⚠️ No available node to auto-assign after payment");
+          }
+        } else {
+          console.log(`🔒 ${email} already has an active VPN node, skipping reassignment.`);
+          await userRef.update({ vpnActive: true });
+        }
+      } catch (err) {
+        console.warn("Auto-assign after purchase failed:", err.message || err);
+        // do NOT throw — assignment failure should not break webhook; plan update already persisted
+      }
+
+      return res.sendStatus(200);
     } catch (err) {
       console.error("❌ Webhook error:", err);
-      res.sendStatus(500);
+      return res.sendStatus(500);
     }
   }
 );
+
 
 // --- Enable JSON parsing + add request logger middleware ---
 app.use(express.json());
