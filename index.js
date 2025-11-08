@@ -882,7 +882,6 @@ if (expired && u.pendingPlan) {
     "plan_activated_from_rollover",
     `🎯 Your new ${newPlan.name} has started — ${newPlan.dataLimit}MB now available.`
   );
-  continue; // skip disable logic
 }
 
 
