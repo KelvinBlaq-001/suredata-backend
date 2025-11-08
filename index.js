@@ -1037,7 +1037,7 @@ app.post("/vpn/disable", async (req, res) => {
 });
 
     res.json({ success: result.ok, result });
-  } catch (err) {
+    catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
