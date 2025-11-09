@@ -1,5 +1,4 @@
-// index.js — SureData Backend (Production-ready, Plan buckets migration + idempotent webhook)
-// NOTE: This file is your original with only the migration + idempotent webhook additions you requested.
+// index.js — SureData Backend (Production-ready, Plan buckets, Idempotent webhook, auto-assign disabled)
 
 import express from "express";
 import cors from "cors";
@@ -37,13 +36,17 @@ const db = admin.firestore();
 // --- Lightweight admin middleware ---
 const adminApiKey = process.env.ADMIN_API_KEY || null;
 if (!adminApiKey) {
-  console.warn("⚠️ ADMIN_API_KEY not set — node admin endpoints will be accessible without admin key. Set ADMIN_API_KEY to secure them.");
+  console.warn(
+    "⚠️ ADMIN_API_KEY not set — node admin endpoints will be accessible without admin key. Set ADMIN_API_KEY to secure them."
+  );
 }
 function requireAdmin(req, res, next) {
   if (!adminApiKey) return next(); // allow in dev
   const key = req.headers["x-admin-key"];
   if (!key || key !== adminApiKey) {
-    return res.status(401).json({ error: "Unauthorized (missing or invalid x-admin-key)" });
+    return res
+      .status(401)
+      .json({ error: "Unauthorized (missing or invalid x-admin-key)" });
   }
   return next();
 }
@@ -65,22 +68,23 @@ async function sendUserNotification(email, type, message) {
 }
 
 // ----------------------
-// TAILSCALE HELPERS (updated with TAILSCALE_API_BASE)
-// ----------------------
+// TAILSCALE HELPERS (best-effort)
 function _tailscaleAuthHeader() {
   const apiKey = process.env.TAILSCALE_API_KEY || "";
   const token = Buffer.from(`${apiKey}:`).toString("base64");
   return `Basic ${token}`;
 }
-
 const BASE_URL = process.env.TAILSCALE_API_BASE || "https://api.tailscale.com/api/v2";
+const TAILNET = process.env.TAILSCALE_TAILNET || null;
 
 async function tailscaleListDevices() {
   try {
-    const tailnet = process.env.TAILSCALE_TAILNET;
-    if (!tailnet) throw new Error("TAILSCALE_TAILNET not set");
-    const url = `${BASE_URL}/tailnet/${encodeURIComponent(tailnet)}/devices`;
-    const res = await fetch(url, { method: "GET", headers: { Authorization: _tailscaleAuthHeader() } });
+    if (!TAILNET) throw new Error("TAILSCALE_TAILNET not set");
+    const url = `${BASE_URL}/tailnet/${encodeURIComponent(TAILNET)}/devices`;
+    const res = await fetch(url, {
+      method: "GET",
+      headers: { Authorization: _tailscaleAuthHeader() },
+    });
     if (!res.ok) {
       const text = await res.text();
       throw new Error(`Tailscale devices fetch failed: ${res.status} ${text}`);
@@ -95,13 +99,42 @@ async function tailscaleListDevices() {
 
 async function tailscaleEnableDevice(deviceId) {
   try {
-    const url = `${BASE_URL}/device/${encodeURIComponent(deviceId)}/enable`;
-    const res = await fetch(url, { method: "POST", headers: { Authorization: _tailscaleAuthHeader() } });
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`Tailscale enable failed: ${res.status} ${text}`);
+    if (!deviceId) throw new Error("deviceId required");
+    if (!TAILNET) {
+      console.warn("No TAILNET set — skipping tailscaleEnableDevice");
+      return { ok: false, error: "no-tailnet" };
     }
-    return { ok: true };
+
+    // Attempts (best-effort)
+    const candidates = [
+      `${BASE_URL}/tailnet/${encodeURIComponent(TAILNET)}/devices/${encodeURIComponent(deviceId)}`,
+      `${BASE_URL}/device/${encodeURIComponent(deviceId)}`,
+      `${BASE_URL}/devices/${encodeURIComponent(deviceId)}`,
+    ];
+
+    for (const url of candidates) {
+      try {
+        const res = await fetch(url, {
+          method: "PATCH",
+          headers: {
+            Authorization: _tailscaleAuthHeader(),
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({}), // no-op
+        });
+        if (res.ok || res.status === 204) {
+          return { ok: true, url };
+        } else {
+          const text = await res.text();
+          console.warn(`tailscaleEnableDevice attempt ${url} -> ${res.status} ${text}`);
+        }
+      } catch (e) {
+        console.warn("tailscaleEnableDevice inner attempt failed:", e.message || e);
+      }
+    }
+
+    console.warn("tailscaleEnableDevice: no supported enable endpoint found");
+    return { ok: false, error: "no-endpoint" };
   } catch (err) {
     console.warn("tailscaleEnableDevice error:", err.message || err);
     return { ok: false, error: err.message };
@@ -110,40 +143,163 @@ async function tailscaleEnableDevice(deviceId) {
 
 async function tailscaleDisableDevice(deviceId) {
   try {
-    const url = `${BASE_URL}/device/${encodeURIComponent(deviceId)}/disable`;
-    const res = await fetch(url, { method: "POST", headers: { Authorization: _tailscaleAuthHeader() } });
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`Tailscale disable failed: ${res.status} ${text}`);
+    if (!deviceId) throw new Error("deviceId required");
+
+    const candidates = [];
+    if (TAILNET) {
+      candidates.push(`${BASE_URL}/tailnet/${encodeURIComponent(TAILNET)}/devices/${encodeURIComponent(deviceId)}`);
     }
-    return { ok: true };
+    candidates.push(`${BASE_URL}/devices/${encodeURIComponent(deviceId)}`);
+    candidates.push(`${BASE_URL}/device/${encodeURIComponent(deviceId)}`);
+
+    for (const url of candidates) {
+      try {
+        const res = await fetch(url, {
+          method: "DELETE",
+          headers: {
+            Authorization: _tailscaleAuthHeader(),
+          },
+        });
+        if (res.ok || res.status === 204) {
+          return { ok: true, url, status: res.status };
+        } else {
+          const text = await res.text();
+          console.warn(`tailscaleDisableDevice attempt ${url} -> ${res.status} ${text}`);
+          if (res.status >= 200 && res.status < 300) {
+            return { ok: true, url, status: res.status };
+          }
+        }
+      } catch (e) {
+        console.warn("tailscaleDisableDevice inner attempt failed:", e.message || e);
+      }
+    }
+
+    return { ok: false, error: "no-supported-endpoint" };
   } catch (err) {
     console.warn("tailscaleDisableDevice error:", err.message || err);
     return { ok: false, error: err.message };
   }
 }
+// ----------------------
 
 // ----------------------
-// === ADDED HELPERS: plan-bucket utilities & migration helpers ===
-// (these are the only additions beyond your original file)
-// Compute total remaining MB from plans array
+// Node management helpers (Firestore: tailscale_nodes)
+async function upsertNode(node) {
+  if (!node.deviceId) {
+    const docRef = db.collection("tailscale_nodes").doc();
+    await docRef.set({
+      hostname: node.hostname || null,
+      ip: node.ip || null,
+      user: node.user || null,
+      assignedTo: node.assignedTo || null,
+      status: node.status || "free",
+      load: node.load || 0.0,
+      online: typeof node.online === "boolean" ? node.online : true,
+      deviceId: docRef.id,
+      lastChecked: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return docRef.id;
+  } else {
+    const docRef = db.collection("tailscale_nodes").doc(node.deviceId);
+    await docRef.set(
+      {
+        deviceId: node.deviceId,
+        hostname: node.hostname || null,
+        ip: node.ip || null,
+        user: node.user || null,
+        assignedTo: node.assignedTo || null,
+        status: node.status || "free",
+        load: node.load || 0.0,
+        online: typeof node.online === "boolean" ? node.online : true,
+        lastChecked: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true }
+    );
+    return node.deviceId;
+  }
+}
+
+async function pickBestNode() {
+  try {
+    const q = await db
+      .collection("tailscale_nodes")
+      .where("online", "==", true)
+      .where("status", "==", "free")
+      .orderBy("load", "asc")
+      .limit(1)
+      .get();
+    if (q.empty) return null;
+    return q.docs[0];
+  } catch (err) {
+    console.warn("pickBestNode error:", err.message || err);
+    return null;
+  }
+}
+
+async function assignNodeToUser(nodeDocRef, userIdOrEmail) {
+  const doc = await nodeDocRef.get();
+  if (!doc.exists) throw new Error("node missing");
+  const data = doc.data() || {};
+  const newLoad = (data.load || 0) + 0.05;
+  await nodeDocRef.update({
+    status: "in_use",
+    assignedTo: userIdOrEmail,
+    load: newLoad,
+    lastChecked: admin.firestore.FieldValue.serverTimestamp(),
+  });
+  return {
+    ok: true,
+    deviceId: doc.id,
+    nodeData: { ...data, load: newLoad, assignedTo: userIdOrEmail },
+  };
+}
+
+async function releaseNode(nodeDocRef) {
+  const doc = await nodeDocRef.get();
+  if (!doc.exists) return { ok: false, reason: "missing" };
+  const data = doc.data() || {};
+  const newLoad = Math.max((data.load || 0) - 0.05, 0);
+  await nodeDocRef.update({
+    status: "free",
+    assignedTo: null,
+    load: newLoad,
+    lastChecked: admin.firestore.FieldValue.serverTimestamp(),
+  });
+  return { ok: true };
+}
+
+async function setNodeOnline(nodeDocRef, online) {
+  await nodeDocRef.update({
+    online,
+    lastChecked: admin.firestore.FieldValue.serverTimestamp(),
+  });
+}
+// ----------------------
+
+// ----------------------
+// Plan bucket helpers (canonical model)
+
 function computeTotalRemainingFromPlans(plans = []) {
   if (!Array.isArray(plans)) return 0;
   return plans.reduce((sum, p) => {
-    const rem = p.remainingMB != null ? Number(p.remainingMB) : Number(p.dataLimitMB || p.dataLimit || 0);
+    const rem = p.remainingMB != null ? Number(p.remainingMB) : Number(p.dataLimitMB || 0);
     return sum + (isNaN(rem) ? 0 : rem);
   }, 0);
 }
 
-// Append a plan bucket to a user doc and recompute summary fields
+function canonicalIdentifierFromEmailOrUid(emailOrUid) {
+  if (!emailOrUid) return null;
+  return String(emailOrUid).toLowerCase();
+}
+
 async function appendPlanBucketForUser(userRef, bucket) {
-  // Use arrayUnion to append (keeps multi-writer safe). We'll rely on transactions doc for idempotency.
+  // Append bucket using arrayUnion (safe for many concurrent writes).
   await userRef.update({
     plans: admin.firestore.FieldValue.arrayUnion(bucket),
     updatedAt: new Date().toISOString(),
   });
 
-  // Recompute summary fields after append
+  // Recompute summary fields
   const snap = await userRef.get();
   const u = snap.exists ? snap.data() : {};
   const plans = Array.isArray(u.plans) ? u.plans : [];
@@ -165,183 +321,119 @@ async function appendPlanBucketForUser(userRef, bucket) {
   return { totalRemaining, plans };
 }
 
-// Migrate legacy fields into plans[] (idempotent)
-async function migrateLegacyToPlansIfNeeded(userRef, userData) {
-  try {
-    const existingPlans = Array.isArray(userData.plans) ? [...userData.plans] : [];
-    const migrationBuckets = [];
+/**
+ * Consume usageMB from user's plan buckets (earliest expiry first).
+ * Returns { exhausted, remainingNotConsumedMB, totalRemaining, updatedPlans }
+ */
+async function consumeFromPlanBuckets(userRef, usageMB) {
+  const snap = await userRef.get();
+  if (!snap.exists) return { error: "user_not_found" };
 
-    // migrate currentPlan if present and not represented in plans[]
-    if (userData.currentPlan && (userData.planLimit || 0) > 0) {
-      const lowercaseName = String(userData.currentPlan || "").toLowerCase();
-      const present = existingPlans.some((p) => {
-        if (!p) return false;
-        return String(p.name || "").toLowerCase() === lowercaseName && Number(p.dataLimitMB || p.dataLimit || 0) === Number(userData.planLimit || 0);
-      });
-      if (!present) {
-        const rem = Math.max((userData.planLimit || 0) - (userData.dataUsed || 0), 0);
-        migrationBuckets.push({
-          name: userData.currentPlan || "Legacy Plan",
-          dataLimitMB: Number(userData.planLimit || 0),
-          remainingMB: Number(rem),
-          purchasedAt: userData.lastPayment?.date || new Date().toISOString(),
-          expiry: userData.expiryDate || null,
-        });
-      }
-    }
+  const now = new Date();
+  const u = snap.data() || {};
+  let plans = Array.isArray(u.plans) ? [...u.plans] : [];
 
-    // migrate pendingPlan if present and not already in plans[]
-    if (userData.pendingPlan && userData.pendingPlan.dataLimit) {
-      const p = userData.pendingPlan;
-      const lowercaseName = String(p.name || "").toLowerCase();
-      const presentPending = existingPlans.some((ep) => {
-        if (!ep) return false;
-        return String(ep.name || "").toLowerCase() === lowercaseName && Number(ep.dataLimitMB || ep.dataLimit || 0) === Number(p.dataLimit || 0);
-      });
-      if (!presentPending) {
-        const expiry = p.expiryDate || p.expiry || null;
-        migrationBuckets.push({
-          name: p.name || "Pending Plan",
-          dataLimitMB: Number(p.dataLimit || 0),
-          remainingMB: Number(p.dataLimit || 0),
-          purchasedAt: p.purchasedAt || new Date().toISOString(),
-          expiry,
-        });
-      }
-    }
+  // Normalize
+  plans = plans.map((p) => ({
+    name: p.name,
+    dataLimitMB: Number(p.dataLimitMB || p.dataLimit || 0),
+    remainingMB: p.remainingMB != null ? Number(p.remainingMB) : Number(p.dataLimitMB || p.dataLimit || 0),
+    expiry: p.expiry || p.expiryDate || null,
+    purchasedAt: p.purchasedAt || null,
+  }));
 
-    if (migrationBuckets.length > 0) {
-      const mergedPlans = [...existingPlans, ...migrationBuckets];
-      const totalRemaining = computeTotalRemainingFromPlans(mergedPlans);
-      const earliestExpiry = mergedPlans.length
-        ? mergedPlans
-            .map((p) => (p.expiry ? new Date(p.expiry) : null))
-            .filter(Boolean)
-            .sort((a, b) => a - b)[0]
-        : null;
+  // Remove expired / empty
+  plans = plans.filter((p) => {
+    if (!p.expiry) return (p.remainingMB || 0) > 0;
+    const exp = new Date(p.expiry);
+    return exp > now && (p.remainingMB || 0) > 0;
+  });
 
-      // update user doc: set plans[], totalDataDisplay, clear legacy fields to avoid repeated migrations
-      await userRef.update({
-        plans: mergedPlans,
-        totalDataDisplay: totalRemaining,
-        planLimit: totalRemaining,
-        expiryDate: earliestExpiry ? earliestExpiry.toISOString() : admin.firestore.FieldValue.delete(),
-        pendingPlan: admin.firestore.FieldValue.delete(),
-        currentPlan: admin.firestore.FieldValue.delete(),
-        dataUsed: admin.firestore.FieldValue.delete(),
-        updatedAt: new Date().toISOString(),
-      });
+  // Sort earliest expiry first (null expiry last)
+  plans.sort((a, b) => {
+    if (!a.expiry && !b.expiry) return 0;
+    if (!a.expiry) return 1;
+    if (!b.expiry) return -1;
+    return new Date(a.expiry) - new Date(b.expiry);
+  });
 
-      console.log(`Migrated ${migrationBuckets.length} legacy bucket(s) into plans[] for ${userRef.id}`);
-      return { migrated: true, migrationBuckets };
-    }
-    return { migrated: false };
-  } catch (e) {
-    console.warn("Plan migration failed (non-fatal):", e.message || e);
-    return { migrated: false, error: e.message || String(e) };
+  let remainingToConsume = Number(usageMB || 0);
+  for (let i = 0; i < plans.length && remainingToConsume > 0; i++) {
+    const p = plans[i];
+    const avail = Math.max(Number(p.remainingMB || 0), 0);
+    const take = Math.min(avail, remainingToConsume);
+    p.remainingMB = avail - take;
+    remainingToConsume -= take;
   }
-}
-// === END ADDED HELPERS ===
-// ----------------------
 
+  // Remove emptied buckets
+  plans = plans.filter((p) => Number(p.remainingMB || 0) > 0);
 
-// ----------------------
-// Node management helpers (Firestore: tailscale_nodes)
-// ----------------------
+  const totalRemaining = computeTotalRemainingFromPlans(plans);
+  const earliestExpiry = plans.length
+    ? plans
+        .map((p) => (p.expiry ? new Date(p.expiry) : null))
+        .filter(Boolean)
+        .sort((a, b) => a - b)[0]
+    : null;
 
-// Create or update a tailscale_node doc (id can be provided or auto)
-async function upsertNode(node) {
-  // node: { deviceId, hostname, ip, user, assignedTo, status, load, online, lastChecked }
-  if (!node.deviceId) {
-    // fallback to generated id
-    const docRef = db.collection("tailscale_nodes").doc();
-    await docRef.set({
-      hostname: node.hostname || null,
-      ip: node.ip || null,
-      user: node.user || null,
-      assignedTo: node.assignedTo || null,
-      status: node.status || "free",
-      load: node.load || 0.0,
-      online: typeof node.online === "boolean" ? node.online : true,
-      deviceId: docRef.id,
-      lastChecked: admin.firestore.FieldValue.serverTimestamp(),
-    });
-    return docRef.id;
-  } else {
-    const docRef = db.collection("tailscale_nodes").doc(node.deviceId);
-    await docRef.set({
-      deviceId: node.deviceId,
-      hostname: node.hostname || null,
-      ip: node.ip || null,
-      user: node.user || null,
-      assignedTo: node.assignedTo || null,
-      status: node.status || "free",
-      load: node.load || 0.0,
-      online: typeof node.online === "boolean" ? node.online : true,
-      lastChecked: admin.firestore.FieldValue.serverTimestamp(),
-    }, { merge: true });
-    return node.deviceId;
-  }
-}
-
-// Pick best node: online, status === 'free', lowest load. Returns doc snapshot or null.
-async function pickBestNode() {
-  const q = await db.collection("tailscale_nodes")
-    .where("online", "==", true)
-    .where("status", "==", "free")
-    .orderBy("load", "asc")
-    .limit(1)
-    .get();
-  if (q.empty) return null;
-  return q.docs[0];
-}
-
-// assign node: mark status=in_use, assignedTo=userEmail (or uid), increment load slightly
-async function assignNodeToUser(nodeDocRef, userIdOrEmail) {
-  const doc = await nodeDocRef.get();
-  if (!doc.exists) throw new Error("node missing");
-  const data = doc.data() || {};
-  const newLoad = (data.load || 0) + 0.05; // bump load a bit; tune as needed
-  await nodeDocRef.update({
-    status: "in_use",
-    assignedTo: userIdOrEmail,
-    load: newLoad,
-    lastChecked: admin.firestore.FieldValue.serverTimestamp(),
+  await userRef.update({
+    plans,
+    totalDataDisplay: totalRemaining,
+    planLimit: totalRemaining,
+    expiryDate: earliestExpiry ? earliestExpiry.toISOString() : admin.firestore.FieldValue.delete(),
+    updatedAt: new Date().toISOString(),
   });
-  return { ok: true, deviceId: doc.id, nodeData: { ...data, load: newLoad, assignedTo: userIdOrEmail } };
+
+  return {
+    exhausted: remainingToConsume > 0,
+    remainingNotConsumedMB: remainingToConsume,
+    totalRemaining,
+    updatedPlans: plans,
+  };
 }
 
-async function releaseNode(nodeDocRef) {
-  const doc = await nodeDocRef.get();
-  if (!doc.exists) return { ok: false, reason: "missing" };
-  const data = doc.data() || {};
-  // decrement load but not below 0
-  const newLoad = Math.max((data.load || 0) - 0.05, 0);
-  await nodeDocRef.update({
-    status: "free",
-    assignedTo: null,
-    load: newLoad,
-    lastChecked: admin.firestore.FieldValue.serverTimestamp(),
+async function purgeExpiredBucketsForUser(userRef) {
+  const snap = await userRef.get();
+  if (!snap.exists) return { totalRemaining: 0 };
+  const now = new Date();
+  const u = snap.data() || {};
+  let plans = Array.isArray(u.plans) ? [...u.plans] : [];
+  plans = plans.filter((p) => {
+    if (!p.expiry) return (p.remainingMB || p.dataLimitMB || p.dataLimit || 0) > 0;
+    const exp = new Date(p.expiry);
+    return exp > now && (p.remainingMB || p.dataLimitMB || p.dataLimit || 0) > 0;
   });
-  return { ok: true };
-}
 
-// mark node offline/online (status unaffected)
-async function setNodeOnline(nodeDocRef, online) {
-  await nodeDocRef.update({
-    online,
-    lastChecked: admin.firestore.FieldValue.serverTimestamp(),
+  const totalRemaining = computeTotalRemainingFromPlans(plans);
+  const earliestExpiry = plans.length
+    ? plans
+        .map((p) => (p.expiry ? new Date(p.expiry) : null))
+        .filter(Boolean)
+        .sort((a, b) => a - b)[0]
+    : null;
+
+  await userRef.update({
+    plans,
+    totalDataDisplay: totalRemaining,
+    planLimit: totalRemaining,
+    expiryDate: earliestExpiry ? earliestExpiry.toISOString() : admin.firestore.FieldValue.delete(),
+    updatedAt: new Date().toISOString(),
   });
+
+  return { totalRemaining, plans };
 }
+// ----------------------
 
 // ----------------------------
-// PAYSTACK WEBHOOK (UPDATED: idempotent + migration into plans[])
+// PAYSTACK WEBHOOK (idempotent + migration -> plans[])
+// ----------------------------
 app.post(
   "/payments/webhook",
   express.raw({ type: "application/json" }),
   async (req, res) => {
     try {
-      const secret = process.env.PAYSTACK_SECRET_KEY; // ✅ fixed variable name
+      const secret = process.env.PAYSTACK_SECRET_KEY;
       if (!secret) {
         console.error("❌ PAYSTACK_SECRET_KEY missing in .env");
         return res.status(500).send("Server misconfigured");
@@ -358,11 +450,7 @@ app.post(
 
       const receivedHash = req.headers["x-paystack-signature"];
 
-      // ✅ Allow easy testing
-      if (
-        process.env.NODE_ENV !== "production" &&
-        receivedHash === "test-bypass"
-      ) {
+      if (process.env.NODE_ENV !== "production" && receivedHash === "test-bypass") {
         console.log("🧪 Paystack test-bypass active");
       } else if (computedHash !== receivedHash) {
         console.log("⚠️ Invalid Paystack signature");
@@ -374,27 +462,28 @@ app.post(
 
       const data = event.data;
       const reference = data.reference;
-      const amount = data.amount / 100;
+      const amount = data.amount / 100; // amount in Naira
       const email = (data.customer?.email || "").toLowerCase();
 
-      // --- IDP: check transactions doc to avoid duplicate processing ---
+      // Idempotency: check transactions doc for this reference
       const txRef = db.collection("transactions").doc(reference);
       const txSnap = await txRef.get();
       if (txSnap.exists && txSnap.data() && txSnap.data().status === "success") {
-        console.log(`🔁 Duplicate webhook detected for reference ${reference} — skipping.`);
+        console.log(`🔁 Duplicate webhook for reference ${reference} — already processed.`);
         return res.sendStatus(200);
       }
 
-      // mark processing (prevents concurrent double writes)
+      // Mark transaction as processing (so concurrent webhook attempts won't double-process)
+      const now = new Date();
       await txRef.set({
         email,
         reference,
         amount,
         status: "processing",
-        receivedAt: new Date().toISOString()
+        createdAt: now.toISOString(),
       }, { merge: true });
 
-      // ✅ Match plan by amount
+      // Match plan by amount (MB)
       const plans = {
         500: { name: "Basic Plan", dataLimit: 1 * 1024, days: 30 },
         1000: { name: "Standard Plan", dataLimit: 3 * 1024, days: 30 },
@@ -408,18 +497,14 @@ app.post(
         return res.sendStatus(200);
       }
 
-      // ✅ Find user
+      // Find user
       const usersRef = db.collection("users");
       const snap = await usersRef.where("email", "==", email).limit(1).get();
       if (snap.empty) {
         console.log(`❌ User not found for email ${email}`);
         await txRef.set({
-          email,
-          reference,
-          amount,
           status: "user_not_found",
           timestamp: new Date().toISOString(),
-          note: "user_not_found"
         }, { merge: true });
         return res.sendStatus(200);
       }
@@ -429,13 +514,78 @@ app.post(
 
       // --- MIGRATE LEGACY FIELDS INTO plans[] IF NEEDED (idempotent) ---
       try {
-        await migrateLegacyToPlansIfNeeded(userRef, userData);
+        const existingPlans = Array.isArray(userData.plans) ? [...userData.plans] : [];
+        const migrationBuckets = [];
+
+        // migrate currentPlan if it exists and not represented in plans
+        if (userData.currentPlan && (userData.planLimit || 0) > 0) {
+          const lowercaseName = String(userData.currentPlan || "").toLowerCase();
+          const present = existingPlans.some((p) => {
+            if (!p) return false;
+            return String(p.name || "").toLowerCase() === lowercaseName && Number(p.dataLimitMB || p.dataLimit || 0) === Number(userData.planLimit || 0);
+          });
+          if (!present) {
+            const rem = Math.max((userData.planLimit || 0) - (userData.dataUsed || 0), 0);
+            migrationBuckets.push({
+              name: userData.currentPlan || "Legacy Plan",
+              dataLimitMB: Number(userData.planLimit || 0),
+              remainingMB: Number(rem),
+              purchasedAt: userData.lastPayment?.date || new Date().toISOString(),
+              expiry: userData.expiryDate || null,
+            });
+          }
+        }
+
+        // migrate pendingPlan (legacy) into a bucket if not present
+        if (userData.pendingPlan && userData.pendingPlan.dataLimit) {
+          const p = userData.pendingPlan;
+          const lowercaseName = String(p.name || "").toLowerCase();
+          const presentPending = existingPlans.some((ep) => {
+            if (!ep) return false;
+            return String(ep.name || "").toLowerCase() === lowercaseName && Number(ep.dataLimitMB || ep.dataLimit || 0) === Number(p.dataLimit || 0);
+          });
+          if (!presentPending) {
+            const expiry = p.expiryDate || p.expiry || null;
+            migrationBuckets.push({
+              name: p.name || "Pending Plan",
+              dataLimitMB: Number(p.dataLimit || 0),
+              remainingMB: Number(p.dataLimit || 0),
+              purchasedAt: p.purchasedAt || new Date().toISOString(),
+              expiry,
+            });
+          }
+        }
+
+        if (migrationBuckets.length > 0) {
+          // merge and write once
+          const mergedPlans = [...existingPlans, ...migrationBuckets];
+          const totalRemaining = computeTotalRemainingFromPlans(mergedPlans);
+          const earliestExpiry = mergedPlans.length
+            ? mergedPlans
+                .map((p) => (p.expiry ? new Date(p.expiry) : null))
+                .filter(Boolean)
+                .sort((a, b) => a - b)[0]
+            : null;
+
+          await userRef.update({
+            plans: mergedPlans,
+            totalDataDisplay: totalRemaining,
+            planLimit: totalRemaining,
+            expiryDate: earliestExpiry ? earliestExpiry.toISOString() : admin.firestore.FieldValue.delete(),
+            // clear legacy fields to avoid repeat migrations
+            pendingPlan: admin.firestore.FieldValue.delete(),
+            currentPlan: admin.firestore.FieldValue.delete(),
+            dataUsed: admin.firestore.FieldValue.delete(),
+            updatedAt: new Date().toISOString(),
+          });
+
+          console.log(`Migrated legacy plan(s) into plans[] for ${email}. migrated=${migrationBuckets.length}`);
+        }
       } catch (e) {
-        console.warn("Legacy migration error (non-fatal):", e.message || e);
+        console.warn("Plan migration failed (non-fatal):", e.message || e);
       }
 
-      // Build new bucket
-      const now = new Date();
+      // --- Build & append new bucket for this purchase ---
       const newExpiry = new Date();
       newExpiry.setDate(newExpiry.getDate() + plan.days);
 
@@ -447,11 +597,11 @@ app.post(
         expiry: newExpiry.toISOString(),
       };
 
-      // Append bucket and finalize transaction (idempotent via transactions doc above)
+      // Append bucket with idempotency guard via transaction doc (we already set txRef to processing).
       try {
         const appendRes = await appendPlanBucketForUser(userRef, bucket);
 
-        // update transaction as success
+        // Mark transaction success
         await txRef.set({
           status: "success",
           processedAt: new Date().toISOString(),
@@ -466,26 +616,25 @@ app.post(
           updatedAt: new Date().toISOString(),
         });
 
-        console.log(`✅ ${email} purchased ${plan.name} — bucket appended. totalRemaining=${appendRes.totalRemaining}`);
-
-        // Notify user
         await sendUserNotification(
           email,
           "plan_purchased",
-          `🎉 You’ve successfully purchased the ${plan.name}. +${plan.dataLimit}MB — total available: ${appendRes.totalRemaining}MB.`
+          `🎉 You purchased ${plan.name}. +${plan.dataLimit}MB — total available: ${appendRes.totalRemaining}MB.`
         );
 
-        return res.sendStatus(200);
+        console.log(`✅ Processed payment ${reference} for ${email} — plan ${plan.name} added.`);
       } catch (e) {
-        console.error("Failed to append plan bucket or finalize transaction:", e.message || e);
-        // mark transaction failed
+        console.error("Failed to append plan bucket or finalize tx:", e.message || e);
+        // mark transaction failed so it can be inspected / retried manually
         await txRef.set({
           status: "failed",
           processedAt: new Date().toISOString(),
-          error: String(e.message || e)
+          error: String(e.message || e),
         }, { merge: true });
-        return res.sendStatus(500);
       }
+
+      // NOTE: automatic node assignment intentionally REMOVED to avoid the errors you saw.
+      return res.sendStatus(200);
     } catch (err) {
       console.error("❌ Webhook error:", err);
       return res.sendStatus(500);
@@ -505,7 +654,6 @@ app.use((req, res, next) => {
 
 // ----------------------
 // Health / Admin
-// ----------------------
 app.get("/health", (_, res) => res.status(200).send("OK"));
 
 app.get("/admin/summary", async (_, res) => {
@@ -522,7 +670,7 @@ app.get("/admin/summary", async (_, res) => {
       const u = doc.data();
       if (u.vpnActive) active++;
       if (u.expiryDate && new Date(u.expiryDate) < now) expired++;
-      if (u.currentPlan) withPlan++;
+      if (u.plans && u.plans.length) withPlan++;
     });
 
     res.json({ total, active, expired, withPlan });
@@ -533,13 +681,10 @@ app.get("/admin/summary", async (_, res) => {
 });
 
 // ----------------------
-// Tailscale & Node Endpoints
-// ----------------------
-
-// Seed nodes from a JSON array in request body (admin)
+// Tailscale & Node Endpoints (manual admin control)
 app.post("/tailscale/seed-nodes", requireAdmin, async (req, res) => {
   try {
-    const nodes = req.body.nodes; // expect array of {deviceId, hostname, ip, user}
+    const nodes = req.body.nodes;
     if (!Array.isArray(nodes)) return res.status(400).json({ error: "nodes array required" });
 
     const results = [];
@@ -564,19 +709,17 @@ app.post("/tailscale/seed-nodes", requireAdmin, async (req, res) => {
   }
 });
 
-// Cron-like: sync nodes from Tailscale API into tailscale_nodes collection (admin)
 app.post("/tailscale/sync-from-api", requireAdmin, async (req, res) => {
   try {
     const devices = await tailscaleListDevices();
     const upserts = [];
     for (const d of devices) {
-      // map device fields to our node doc
       const deviceId = d.id || d.node_id || d.key || d.idString || d.id?.toString();
       const hostname = d.hostname || d.name || null;
       const ip = (d.allAddresses && d.allAddresses[0]) || d.addresses?.[0] || null;
       const user = d.user || d.userName || null;
       const online = d.online !== undefined ? !!d.online : true;
-      const load = 0.0; // initial; you might later populate from metrics
+      const load = 0.0;
       const status = "free";
 
       await upsertNode({
@@ -599,18 +742,17 @@ app.post("/tailscale/sync-from-api", requireAdmin, async (req, res) => {
   }
 });
 
-// Auto-assign a node to a user (called by backend when user purchases or app when user connects)
-// Request: { email, uid } — admin header optional depending on ADMIN_API_KEY
+// Manual auto-assign endpoint (admin-only) still available
 app.post("/vpn/node/auto-assign", requireAdmin, async (req, res) => {
   try {
     const { email, uid } = req.body;
-    const userIdentifier = (uid || email);
-    if (!userIdentifier) return res.status(400).json({ error: "email or uid required" });
+    const rawIdentifier = uid || email;
+    if (!rawIdentifier) return res.status(400).json({ error: "email or uid required" });
 
-    // pick best node
+    const userIdentifier = canonicalIdentifierFromEmailOrUid(rawIdentifier);
+
     const nodeDoc = await pickBestNode();
     if (!nodeDoc) {
-      // fallback: try to pick any online node
       const alt = await db.collection("tailscale_nodes")
         .where("online", "==", true)
         .orderBy("load", "asc")
@@ -621,7 +763,6 @@ app.post("/vpn/node/auto-assign", requireAdmin, async (req, res) => {
       } else {
         const docRef = alt.docs[0].ref;
         const r = await assignNodeToUser(docRef, userIdentifier);
-        // create vpn_sessions record
         await db.collection("vpn_sessions").doc(userIdentifier).set({
           nodeId: docRef.id,
           assignedAt: new Date().toISOString(),
@@ -635,7 +776,6 @@ app.post("/vpn/node/auto-assign", requireAdmin, async (req, res) => {
     const docRef = nodeDoc.ref;
     const assignRes = await assignNodeToUser(docRef, userIdentifier);
 
-    // Save session
     await db.collection("vpn_sessions").doc(userIdentifier).set({
       nodeId: docRef.id,
       assignedAt: new Date().toISOString(),
@@ -650,14 +790,14 @@ app.post("/vpn/node/auto-assign", requireAdmin, async (req, res) => {
   }
 });
 
-// Revoke node for a user (unassign)
-// Request: { email or uid }
+// Revoke node (admin)
 app.post("/vpn/node/revoke", requireAdmin, async (req, res) => {
   try {
     const { email, uid } = req.body;
-    const userIdentifier = (uid || email);
-    if (!userIdentifier) return res.status(400).json({ error: "email or uid required" });
+    const rawIdentifier = uid || email;
+    if (!rawIdentifier) return res.status(400).json({ error: "email or uid required" });
 
+    const userIdentifier = canonicalIdentifierFromEmailOrUid(rawIdentifier);
     const sessionRef = db.collection("vpn_sessions").doc(userIdentifier);
     const sessionSnap = await sessionRef.get();
     if (!sessionSnap.exists) return res.status(404).json({ error: "No active session for user" });
@@ -666,22 +806,47 @@ app.post("/vpn/node/revoke", requireAdmin, async (req, res) => {
     const nodeId = session.nodeId;
     if (nodeId) {
       const nodeRef = db.collection("tailscale_nodes").doc(nodeId);
-      // attempt to disable device at Tailscale as well (best-effort)
       try {
-        await tailscaleDisableDevice(nodeId);
+        const tailscaleRes = await tailscaleDisableDevice(nodeId);
+        console.log("tailscaleDisableDevice result:", tailscaleRes);
       } catch (err) {
-        console.warn("tailscaleDisableDevice failed:", err.message || err);
+        console.warn("tailscaleDisableDevice failed:", err?.message || err);
       }
-      await releaseNode(nodeRef);
+      try {
+        await releaseNode(nodeRef);
+      } catch (err) {
+        console.warn("releaseNode failed:", err?.message || err);
+      }
     }
 
-    // mark session inactive
     await sessionRef.update({ active: false, revokedAt: new Date().toISOString() });
+
+    try {
+      let userDocSnap = null;
+      if (uid) {
+        userDocSnap = await db.collection("users").doc(uid).get();
+      }
+      if (!userDocSnap || !userDocSnap.exists) {
+        const q = await db.collection("users").where("email", "==", email).limit(1).get();
+        if (!q.empty) userDocSnap = q.docs[0];
+      }
+      if (userDocSnap && userDocSnap.exists) {
+        await userDocSnap.ref.update({
+          vpnActive: false,
+          revokedAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+        });
+      } else {
+        console.warn("User doc not found while revoking for", userIdentifier);
+      }
+    } catch (e) {
+      console.warn("Failed to update user doc during revoke:", e?.message || e);
+    }
 
     res.json({ success: true, revoked: true, nodeId: nodeId || null });
   } catch (err) {
-    console.error("/vpn/node/revoke error:", err.message || err);
-    res.status(500).json({ error: err.message });
+    console.error("/vpn/node/revoke error:", err?.message || err);
+    res.status(500).json({ error: err?.message || String(err) });
   }
 });
 
@@ -701,11 +866,54 @@ app.get("/vpn/status/:uid", async (req, res) => {
 });
 
 // ----------------------
-// Existing VPN session handlers (connect/disconnect/update-usage) - kept mostly as-is
+// VPN session handlers (connect/disconnect/update-usage)
+async function disableVPNAccess(usernameOrEmail) {
+  try {
+    let userDoc = null;
+    const byUid = await db.collection("users").doc(usernameOrEmail).get();
+    if (byUid.exists) userDoc = byUid;
+    if (!userDoc) {
+      const q = await db.collection("users").where("email", "==", usernameOrEmail).limit(1).get();
+      if (!q.empty) userDoc = q.docs[0];
+    }
+    if (userDoc) {
+      await userDoc.ref.update({
+        vpnActive: false,
+        revokedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+    }
+
+    const sessionRef = db.collection("vpn_sessions").doc(usernameOrEmail);
+    const s = await sessionRef.get();
+    if (s.exists) {
+      const sess = s.data() || {};
+      if (sess.nodeId) {
+        try {
+          await tailscaleDisableDevice(sess.nodeId);
+        } catch (e) {
+          console.warn("disableVPNAccess tailscaleDisableDevice failed", e.message || e);
+        }
+        try {
+          await releaseNode(db.collection("tailscale_nodes").doc(sess.nodeId));
+        } catch (e) {
+          console.warn("disableVPNAccess releaseNode failed", e.message || e);
+        }
+      }
+      await sessionRef.update({ active: false, revokedAt: new Date().toISOString() });
+    }
+  } catch (err) {
+    console.warn("disableVPNAccess error:", err.message || err);
+  }
+}
+
 app.post("/vpn/session/connect", async (req, res) => {
   try {
     const { username, vpn_ip } = req.body;
-    const snap = await db.collection("users").where("email", "==", username).limit(1).get();
+    if (!username) return res.status(400).json({ error: "username required" });
+
+    const email = String(username).toLowerCase();
+    const snap = await db.collection("users").where("email", "==", email).limit(1).get();
     if (snap.empty) return res.status(404).json({ error: "User not found" });
 
     const docRef = snap.docs[0].ref;
@@ -713,29 +921,16 @@ app.post("/vpn/session/connect", async (req, res) => {
       vpnActive: true,
       vpnIP: vpn_ip,
       lastConnect: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
     });
 
-    // optional: ensure tailscale device enabled when user connects (try to use stored vpnDeviceId)
     try {
       const user = snap.docs[0].data();
       if (user && user.vpnDeviceId) {
         await tailscaleEnableDevice(user.vpnDeviceId);
       } else {
-        // attempt to auto-assign a node if none assigned (best-effort)
-        const uidOrEmail = user.uid || user.email;
-        const existingSession = await db.collection("vpn_sessions").doc(uidOrEmail).get();
-        if (!existingSession.exists) {
-          const pick = await pickBestNode();
-          if (pick) {
-            await assignNodeToUser(pick.ref, uidOrEmail);
-            await db.collection("vpn_sessions").doc(uidOrEmail).set({
-              nodeId: pick.ref.id,
-              assignedAt: new Date().toISOString(),
-              active: true,
-              user: user.email || uidOrEmail,
-            });
-          }
-        }
+        // Auto-assign on connect intentionally DISABLED (to avoid previous errors).
+        console.log(`Auto-assign on connect disabled for ${email}.`);
       }
     } catch (err) {
       console.warn("connect: tailscale enable attempt failed:", err.message || err);
@@ -751,35 +946,33 @@ app.post("/vpn/session/connect", async (req, res) => {
 app.post("/vpn/session/disconnect", async (req, res) => {
   try {
     const { username, data_used_mb = 0 } = req.body;
-    const snap = await db.collection("users").where("email", "==", username).limit(1).get();
+    if (!username) return res.status(400).json({ error: "username required" });
+
+    const email = String(username).toLowerCase();
+    const snap = await db.collection("users").where("email", "==", email).limit(1).get();
     if (snap.empty) return res.status(404).json({ error: "User not found" });
 
-    const doc = snap.docs[0];
-    const u = doc.data();
-    const used = (u.dataUsed || 0) + data_used_mb;
-    const over = used >= (u.planLimit || Infinity);
-    const expired = u.expiryDate && new Date(u.expiryDate) < new Date();
+    const userRef = snap.docs[0].ref;
+    const consumeRes = await consumeFromPlanBuckets(userRef, Number(data_used_mb || 0));
+    const over = consumeRes.exhausted;
+    const expired = consumeRes.totalRemaining <= 0;
 
-    await doc.ref.update({
-      dataUsed: used,
-      vpnActive: !over && !expired,
+    await userRef.update({
       lastDisconnect: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
+      vpnActive: !over && !expired,
     });
 
     if (over || expired) {
-      // disable both local VPN and tailscale device
-      await disableVPNAccess(username);
+      await disableVPNAccess(email);
       await sendUserNotification(
-        username,
+        email,
         "plan_exhausted",
-        expired
-          ? "Your plan has expired. Please renew."
-          : "Your data limit has been exhausted."
+        expired ? "Your plan has expired. Please renew." : "Your data limit has been exhausted."
       );
     }
 
-    res.json({ success: true });
+    res.json({ success: true, consumeResult: consumeRes });
   } catch (err) {
     console.error("Disconnect error:", err.message || err);
     res.status(500).json({ error: err.message });
@@ -789,43 +982,45 @@ app.post("/vpn/session/disconnect", async (req, res) => {
 app.post("/vpn/session/update-usage", async (req, res) => {
   try {
     const { username, usage_mb = 0 } = req.body;
-    const snap = await db.collection("users").where("email", "==", username).limit(1).get();
+    if (!username) return res.status(400).json({ error: "username required" });
+
+    const email = String(username).toLowerCase();
+    const snap = await db.collection("users").where("email", "==", email).limit(1).get();
     if (snap.empty) return res.status(404).json({ error: "User not found" });
 
-    const doc = snap.docs[0];
-    const u = doc.data();
-    const used = (u.dataUsed || 0) + usage_mb;
-    const percent = (used / (u.planLimit || 1)) * 100;
+    const userRef = snap.docs[0].ref;
+    const prevTotal = snap.docs[0].data().totalDataDisplay || 0;
+
+    const consumeRes = await consumeFromPlanBuckets(userRef, Number(usage_mb || 0));
+    const totalRemaining = consumeRes.totalRemaining || 0;
+    const percent = prevTotal > 0 ? ((prevTotal - totalRemaining) / (prevTotal || 1)) * 100 : 0;
 
     if (percent >= 90 && percent < 100) {
       await sendUserNotification(
-        username,
+        email,
         "plan_near_limit",
-        `⚠️ You've used ${percent.toFixed(0)}% of your plan.`
+        `⚠️ You've used ${Math.min(100, Math.round(percent))}% of your plan.`
       );
     }
 
-    const over = used >= (u.planLimit || Infinity);
-    const expired = u.expiryDate && new Date(u.expiryDate) < new Date();
+    const over = consumeRes.exhausted;
+    const expired = totalRemaining <= 0;
 
-    await doc.ref.update({
-      dataUsed: used,
-      vpnActive: !over && !expired,
+    await userRef.update({
       updatedAt: new Date().toISOString(),
+      vpnActive: !over && !expired,
     });
 
     if (over || expired) {
-      await disableVPNAccess(username);
+      await disableVPNAccess(email);
       await sendUserNotification(
-        username,
+        email,
         "plan_exhausted",
-        over
-          ? "🚫 Your data plan has been exhausted."
-          : "⌛ Your plan has expired."
+        over ? "🚫 Your data plan has been exhausted." : "⌛ Your plan has expired."
       );
     }
 
-    res.json({ success: true });
+    res.json({ success: true, consumeResult: consumeRes });
   } catch (err) {
     console.error("Usage update error:", err.message || err);
     res.status(500).json({ error: err.message });
@@ -834,33 +1029,33 @@ app.post("/vpn/session/update-usage", async (req, res) => {
 
 // ----------------------
 // CRON JOBS
-app.all("/cron/expire-check", async (_, res) => {
+app.get("/cron/expire-check", async (req, res) => {
   try {
-    const now = new Date();
-    const snap = await db.collection("users").get();
+    console.log("⏰ Checking expired users (bucket-based)...");
+    const usersSnapshot = await db.collection("users").get();
     let disabled = 0;
 
-    for (const doc of snap.docs) {
+    for (const doc of usersSnapshot.docs) {
       const u = doc.data();
-      const expired = u.expiryDate && new Date(u.expiryDate) < now;
-      const exhausted =
-        (u.planLimit || 0) > 0 && (u.dataUsed || 0) >= u.planLimit;
+      const purgeRes = await purgeExpiredBucketsForUser(doc.ref);
+      const totalRemaining = purgeRes.totalRemaining || 0;
 
-      if (expired || exhausted) {
-        await doc.ref.update({ vpnActive: false, updatedAt: new Date().toISOString() });
+      if (totalRemaining <= 0) {
         await disableVPNAccess(u.email || u.username || doc.id);
+        await doc.ref.update({ vpnActive: false, updatedAt: new Date().toISOString() });
         disabled++;
+        console.log(`🚫 Disabled user due to no remaining buckets: ${u.email || doc.id}`);
       }
     }
 
-    res.status(200).send(`✅ Disabled ${disabled} users`);
+    res.json({ message: `✅ Expire check done: ${disabled} disabled.` });
   } catch (err) {
-    console.error("Cron expire-check error:", err.message || err);
-    res.status(500).send(err.message);
+    console.error("❌ Expire check error:", err);
+    res.status(500).json({ error: err.message || String(err) });
   }
 });
 
-// Periodic tailscale-sync (keeps tailscale_nodes updated). you can call this endpoint via scheduler
+// Tailscale sync (admin)
 app.get("/cron/tailscale-sync", requireAdmin, async (_, res) => {
   try {
     const devices = await tailscaleListDevices();
@@ -910,17 +1105,13 @@ app.post("/vpn/disable", async (req, res) => {
     const { username } = req.body;
     if (!username) return res.status(400).json({ error: "username required" });
 
-    const result = await (async () => {
-      // attempt to disable via tailscale + optional external vpn endpoint
-      try {
-        await disableVPNAccess(username);
-      } catch (e) {
-        console.warn("vpn/disable disableVPNAccess error", e.message || e);
-      }
-      return { ok: true };
-    })();
+    try {
+      await disableVPNAccess(username);
+    } catch (e) {
+      console.warn("vpn/disable disableVPNAccess error", e.message || e);
+    }
 
-    res.json({ success: result.ok, result });
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
