@@ -1,4 +1,4 @@
-// index.js — SureData Backend (Production-ready, Plan buckets, Canonical sessions, auto-assign disabled)
+// index.js — SureData Backend (Production-ready, Plan buckets, Idempotent webhook, auto-assign disabled)
 
 import express from "express";
 import cors from "cors";
@@ -68,15 +68,13 @@ async function sendUserNotification(email, type, message) {
 }
 
 // ----------------------
-// TAILSCALE HELPERS
-// ----------------------
+// TAILSCALE HELPERS (best-effort)
 function _tailscaleAuthHeader() {
   const apiKey = process.env.TAILSCALE_API_KEY || "";
   const token = Buffer.from(`${apiKey}:`).toString("base64");
   return `Basic ${token}`;
 }
-const BASE_URL =
-  process.env.TAILSCALE_API_BASE || "https://api.tailscale.com/api/v2";
+const BASE_URL = process.env.TAILSCALE_API_BASE || "https://api.tailscale.com/api/v2";
 const TAILNET = process.env.TAILSCALE_TAILNET || null;
 
 async function tailscaleListDevices() {
@@ -109,9 +107,7 @@ async function tailscaleEnableDevice(deviceId) {
 
     // Attempts (best-effort)
     const candidates = [
-      `${BASE_URL}/tailnet/${encodeURIComponent(TAILNET)}/devices/${encodeURIComponent(
-        deviceId
-      )}`,
+      `${BASE_URL}/tailnet/${encodeURIComponent(TAILNET)}/devices/${encodeURIComponent(deviceId)}`,
       `${BASE_URL}/device/${encodeURIComponent(deviceId)}`,
       `${BASE_URL}/devices/${encodeURIComponent(deviceId)}`,
     ];
@@ -137,9 +133,7 @@ async function tailscaleEnableDevice(deviceId) {
       }
     }
 
-    console.warn(
-      "tailscaleEnableDevice: no supported enable endpoint found, returning fallback false"
-    );
+    console.warn("tailscaleEnableDevice: no supported enable endpoint found");
     return { ok: false, error: "no-endpoint" };
   } catch (err) {
     console.warn("tailscaleEnableDevice error:", err.message || err);
@@ -153,11 +147,7 @@ async function tailscaleDisableDevice(deviceId) {
 
     const candidates = [];
     if (TAILNET) {
-      candidates.push(
-        `${BASE_URL}/tailnet/${encodeURIComponent(TAILNET)}/devices/${encodeURIComponent(
-          deviceId
-        )}`
-      );
+      candidates.push(`${BASE_URL}/tailnet/${encodeURIComponent(TAILNET)}/devices/${encodeURIComponent(deviceId)}`);
     }
     candidates.push(`${BASE_URL}/devices/${encodeURIComponent(deviceId)}`);
     candidates.push(`${BASE_URL}/device/${encodeURIComponent(deviceId)}`);
@@ -190,10 +180,10 @@ async function tailscaleDisableDevice(deviceId) {
     return { ok: false, error: err.message };
   }
 }
+// ----------------------
 
 // ----------------------
 // Node management helpers (Firestore: tailscale_nodes)
-// ----------------------
 async function upsertNode(node) {
   if (!node.deviceId) {
     const docRef = db.collection("tailscale_nodes").doc();
@@ -284,10 +274,10 @@ async function setNodeOnline(nodeDocRef, online) {
     lastChecked: admin.firestore.FieldValue.serverTimestamp(),
   });
 }
+// ----------------------
 
 // ----------------------
-// Plan bucket helpers
-// ----------------------
+// Plan bucket helpers (canonical model)
 
 function computeTotalRemainingFromPlans(plans = []) {
   if (!Array.isArray(plans)) return 0;
@@ -303,16 +293,16 @@ function canonicalIdentifierFromEmailOrUid(emailOrUid) {
 }
 
 async function appendPlanBucketForUser(userRef, bucket) {
-  // Append bucket using arrayUnion (safe for concurrent writes).
+  // Append bucket using arrayUnion (safe for many concurrent writes).
   await userRef.update({
     plans: admin.firestore.FieldValue.arrayUnion(bucket),
     updatedAt: new Date().toISOString(),
   });
 
-  // Recompute summary fields after append
+  // Recompute summary fields
   const snap = await userRef.get();
   const u = snap.exists ? snap.data() : {};
-  const plans = u.plans || [];
+  const plans = Array.isArray(u.plans) ? u.plans : [];
   const totalRemaining = computeTotalRemainingFromPlans(plans);
   const earliestExpiry = plans.length
     ? plans
@@ -331,6 +321,10 @@ async function appendPlanBucketForUser(userRef, bucket) {
   return { totalRemaining, plans };
 }
 
+/**
+ * Consume usageMB from user's plan buckets (earliest expiry first).
+ * Returns { exhausted, remainingNotConsumedMB, totalRemaining, updatedPlans }
+ */
 async function consumeFromPlanBuckets(userRef, usageMB) {
   const snap = await userRef.get();
   if (!snap.exists) return { error: "user_not_found" };
@@ -339,20 +333,23 @@ async function consumeFromPlanBuckets(userRef, usageMB) {
   const u = snap.data() || {};
   let plans = Array.isArray(u.plans) ? [...u.plans] : [];
 
+  // Normalize
   plans = plans.map((p) => ({
     name: p.name,
     dataLimitMB: Number(p.dataLimitMB || p.dataLimit || 0),
     remainingMB: p.remainingMB != null ? Number(p.remainingMB) : Number(p.dataLimitMB || p.dataLimit || 0),
     expiry: p.expiry || p.expiryDate || null,
-    purchasedAt: p.purchasedAt || p.purchasedAt || null,
+    purchasedAt: p.purchasedAt || null,
   }));
 
+  // Remove expired / empty
   plans = plans.filter((p) => {
-    if (!p.expiry) return true;
+    if (!p.expiry) return (p.remainingMB || 0) > 0;
     const exp = new Date(p.expiry);
     return exp > now && (p.remainingMB || 0) > 0;
   });
 
+  // Sort earliest expiry first (null expiry last)
   plans.sort((a, b) => {
     if (!a.expiry && !b.expiry) return 0;
     if (!a.expiry) return 1;
@@ -369,6 +366,7 @@ async function consumeFromPlanBuckets(userRef, usageMB) {
     remainingToConsume -= take;
   }
 
+  // Remove emptied buckets
   plans = plans.filter((p) => Number(p.remainingMB || 0) > 0);
 
   const totalRemaining = computeTotalRemainingFromPlans(plans);
@@ -402,7 +400,7 @@ async function purgeExpiredBucketsForUser(userRef) {
   const u = snap.data() || {};
   let plans = Array.isArray(u.plans) ? [...u.plans] : [];
   plans = plans.filter((p) => {
-    if (!p.expiry) return true;
+    if (!p.expiry) return (p.remainingMB || p.dataLimitMB || p.dataLimit || 0) > 0;
     const exp = new Date(p.expiry);
     return exp > now && (p.remainingMB || p.dataLimitMB || p.dataLimit || 0) > 0;
   });
@@ -425,9 +423,10 @@ async function purgeExpiredBucketsForUser(userRef) {
 
   return { totalRemaining, plans };
 }
+// ----------------------
 
 // ----------------------------
-// PAYSTACK WEBHOOK (plan-buckets, migration of legacy fields, auto-assign REMOVED)
+// PAYSTACK WEBHOOK (idempotent + migration -> plans[])
 // ----------------------------
 app.post(
   "/payments/webhook",
@@ -466,6 +465,24 @@ app.post(
       const amount = data.amount / 100; // amount in Naira
       const email = (data.customer?.email || "").toLowerCase();
 
+      // Idempotency: check transactions doc for this reference
+      const txRef = db.collection("transactions").doc(reference);
+      const txSnap = await txRef.get();
+      if (txSnap.exists && txSnap.data() && txSnap.data().status === "success") {
+        console.log(`🔁 Duplicate webhook for reference ${reference} — already processed.`);
+        return res.sendStatus(200);
+      }
+
+      // Mark transaction as processing (so concurrent webhook attempts won't double-process)
+      const now = new Date();
+      await txRef.set({
+        email,
+        reference,
+        amount,
+        status: "processing",
+        createdAt: now.toISOString(),
+      }, { merge: true });
+
       // Match plan by amount (MB)
       const plans = {
         500: { name: "Basic Plan", dataLimit: 1 * 1024, days: 30 },
@@ -476,14 +493,7 @@ app.post(
       const plan = plans[amount];
       if (!plan) {
         console.log(`Unhandled payment amount: ${amount} for ${email}`);
-        await db.collection("transactions").doc(reference).set({
-          email,
-          reference,
-          amount,
-          status: "success",
-          timestamp: new Date().toISOString(),
-          note: "unmapped_amount",
-        });
+        await txRef.set({ status: "unmapped_amount", timestamp: new Date().toISOString() }, { merge: true });
         return res.sendStatus(200);
       }
 
@@ -492,46 +502,27 @@ app.post(
       const snap = await usersRef.where("email", "==", email).limit(1).get();
       if (snap.empty) {
         console.log(`❌ User not found for email ${email}`);
-        await db.collection("transactions").doc(reference).set({
-          email,
-          reference,
-          amount,
-          status: "success",
+        await txRef.set({
+          status: "user_not_found",
           timestamp: new Date().toISOString(),
-          note: "user_not_found",
-        });
+        }, { merge: true });
         return res.sendStatus(200);
       }
 
       const userRef = snap.docs[0].ref;
       const userData = snap.docs[0].data();
 
-      // Save transaction record
-      const now = new Date();
-      await db.collection("transactions").doc(reference).set({
-        email,
-        reference,
-        amount,
-        plan: plan.name,
-        status: "success",
-        timestamp: now.toISOString(),
-      });
-
-      // --- MIGRATE LEGACY FIELDS INTO plans[] IF NEEDED ---
-      // If userData has legacy currentPlan/pendingPlan/planLimit etc but doesn't have equivalent plans array entries,
-      // convert them into plan buckets so totalDataDisplay will reflect real total.
+      // --- MIGRATE LEGACY FIELDS INTO plans[] IF NEEDED (idempotent) ---
       try {
         const existingPlans = Array.isArray(userData.plans) ? [...userData.plans] : [];
         const migrationBuckets = [];
 
         // migrate currentPlan if it exists and not represented in plans
         if (userData.currentPlan && (userData.planLimit || 0) > 0) {
-          // check if an equivalent plan already present (by name + expiry)
+          const lowercaseName = String(userData.currentPlan || "").toLowerCase();
           const present = existingPlans.some((p) => {
             if (!p) return false;
-            return (
-              String(p.name || "").toLowerCase() === String(userData.currentPlan || "").toLowerCase()
-            );
+            return String(p.name || "").toLowerCase() === lowercaseName && Number(p.dataLimitMB || p.dataLimit || 0) === Number(userData.planLimit || 0);
           });
           if (!present) {
             const rem = Math.max((userData.planLimit || 0) - (userData.dataUsed || 0), 0);
@@ -545,15 +536,13 @@ app.post(
           }
         }
 
-        // migrate pendingPlan (legacy) into a bucket (we will keep rollover behavior by storing it as a separate bucket)
+        // migrate pendingPlan (legacy) into a bucket if not present
         if (userData.pendingPlan && userData.pendingPlan.dataLimit) {
           const p = userData.pendingPlan;
+          const lowercaseName = String(p.name || "").toLowerCase();
           const presentPending = existingPlans.some((ep) => {
             if (!ep) return false;
-            return (
-              String(ep.name || "").toLowerCase() === String(p.name || "").toLowerCase() &&
-              Number(ep.dataLimitMB || ep.dataLimit || 0) === Number(p.dataLimit || 0)
-            );
+            return String(ep.name || "").toLowerCase() === lowercaseName && Number(ep.dataLimitMB || ep.dataLimit || 0) === Number(p.dataLimit || 0);
           });
           if (!presentPending) {
             const expiry = p.expiryDate || p.expiry || null;
@@ -568,6 +557,7 @@ app.post(
         }
 
         if (migrationBuckets.length > 0) {
+          // merge and write once
           const mergedPlans = [...existingPlans, ...migrationBuckets];
           const totalRemaining = computeTotalRemainingFromPlans(mergedPlans);
           const earliestExpiry = mergedPlans.length
@@ -577,23 +567,19 @@ app.post(
                 .sort((a, b) => a - b)[0]
             : null;
 
-          // overwrite plans array to include migrated buckets
           await userRef.update({
             plans: mergedPlans,
             totalDataDisplay: totalRemaining,
             planLimit: totalRemaining,
             expiryDate: earliestExpiry ? earliestExpiry.toISOString() : admin.firestore.FieldValue.delete(),
-            // clear legacy pendingPlan/currentPlan to avoid duplicate-migrations later
+            // clear legacy fields to avoid repeat migrations
             pendingPlan: admin.firestore.FieldValue.delete(),
             currentPlan: admin.firestore.FieldValue.delete(),
-            dataUsed: admin.firestore.FieldValue.delete(), // we'll manage usage via buckets
+            dataUsed: admin.firestore.FieldValue.delete(),
             updatedAt: new Date().toISOString(),
           });
 
-          console.log(`Migrated legacy plan/pendingPlan into plans[] for ${email}`, {
-            migrated: migrationBuckets.length,
-            totalRemaining,
-          });
+          console.log(`Migrated legacy plan(s) into plans[] for ${email}. migrated=${migrationBuckets.length}`);
         }
       } catch (e) {
         console.warn("Plan migration failed (non-fatal):", e.message || e);
@@ -611,30 +597,43 @@ app.post(
         expiry: newExpiry.toISOString(),
       };
 
+      // Append bucket with idempotency guard via transaction doc (we already set txRef to processing).
       try {
         const appendRes = await appendPlanBucketForUser(userRef, bucket);
-        console.log(`✅ Appended plan bucket for ${email}. totalRemaining=${appendRes.totalRemaining}`);
 
-        // Mark user vpnActive true and update lastPayment (legacy convenience)
+        // Mark transaction success
+        await txRef.set({
+          status: "success",
+          processedAt: new Date().toISOString(),
+          plan: plan.name,
+          totalAfter: appendRes.totalRemaining,
+        }, { merge: true });
+
+        // convenience legacy fields for older clients
         await userRef.update({
           vpnActive: true,
           lastPayment: { amount, reference, date: now.toISOString() },
           updatedAt: new Date().toISOString(),
         });
 
-        // Send notification
         await sendUserNotification(
           email,
           "plan_purchased",
-          `🎉 You’ve purchased ${plan.name}. ${plan.dataLimit}MB added. Total available: ${appendRes.totalRemaining}MB.`
+          `🎉 You purchased ${plan.name}. +${plan.dataLimit}MB — total available: ${appendRes.totalRemaining}MB.`
         );
+
+        console.log(`✅ Processed payment ${reference} for ${email} — plan ${plan.name} added.`);
       } catch (e) {
-        console.warn("Failed to append plan bucket:", e.message || e);
+        console.error("Failed to append plan bucket or finalize tx:", e.message || e);
+        // mark transaction failed so it can be inspected / retried manually
+        await txRef.set({
+          status: "failed",
+          processedAt: new Date().toISOString(),
+          error: String(e.message || e),
+        }, { merge: true });
       }
 
-      // NOTE: automatic node assignment was intentionally REMOVED here to avoid errors.
-      // If you want manual assignment, use the /vpn/node/auto-assign endpoint.
-
+      // NOTE: automatic node assignment intentionally REMOVED to avoid the errors you saw.
       return res.sendStatus(200);
     } catch (err) {
       console.error("❌ Webhook error:", err);
@@ -655,7 +654,6 @@ app.use((req, res, next) => {
 
 // ----------------------
 // Health / Admin
-// ----------------------
 app.get("/health", (_, res) => res.status(200).send("OK"));
 
 app.get("/admin/summary", async (_, res) => {
@@ -683,10 +681,7 @@ app.get("/admin/summary", async (_, res) => {
 });
 
 // ----------------------
-// Tailscale & Node Endpoints
-// ----------------------
-
-// Seed nodes (admin)
+// Tailscale & Node Endpoints (manual admin control)
 app.post("/tailscale/seed-nodes", requireAdmin, async (req, res) => {
   try {
     const nodes = req.body.nodes;
@@ -714,7 +709,6 @@ app.post("/tailscale/seed-nodes", requireAdmin, async (req, res) => {
   }
 });
 
-// Tailscale sync (admin)
 app.post("/tailscale/sync-from-api", requireAdmin, async (req, res) => {
   try {
     const devices = await tailscaleListDevices();
@@ -748,7 +742,7 @@ app.post("/tailscale/sync-from-api", requireAdmin, async (req, res) => {
   }
 });
 
-// Manual auto-assign endpoint remains (admin-controlled)
+// Manual auto-assign endpoint (admin-only) still available
 app.post("/vpn/node/auto-assign", requireAdmin, async (req, res) => {
   try {
     const { email, uid } = req.body;
@@ -810,7 +804,6 @@ app.post("/vpn/node/revoke", requireAdmin, async (req, res) => {
 
     const session = sessionSnap.data() || {};
     const nodeId = session.nodeId;
-
     if (nodeId) {
       const nodeRef = db.collection("tailscale_nodes").doc(nodeId);
       try {
@@ -874,7 +867,6 @@ app.get("/vpn/status/:uid", async (req, res) => {
 
 // ----------------------
 // VPN session handlers (connect/disconnect/update-usage)
-// ----------------------
 async function disableVPNAccess(usernameOrEmail) {
   try {
     let userDoc = null;
@@ -935,10 +927,9 @@ app.post("/vpn/session/connect", async (req, res) => {
     try {
       const user = snap.docs[0].data();
       if (user && user.vpnDeviceId) {
-        // still try enabling the existing device (best-effort)
         await tailscaleEnableDevice(user.vpnDeviceId);
       } else {
-        // Auto-assign on connect has been DISABLED to avoid errors.
+        // Auto-assign on connect intentionally DISABLED (to avoid previous errors).
         console.log(`Auto-assign on connect disabled for ${email}.`);
       }
     } catch (err) {
@@ -1038,7 +1029,6 @@ app.post("/vpn/session/update-usage", async (req, res) => {
 
 // ----------------------
 // CRON JOBS
-// ----------------------
 app.get("/cron/expire-check", async (req, res) => {
   try {
     console.log("⏰ Checking expired users (bucket-based)...");
@@ -1098,7 +1088,6 @@ app.get("/cron/tailscale-sync", requireAdmin, async (_, res) => {
 
 // ----------------------
 // Misc. Test Endpoints
-// ----------------------
 app.post("/notify/test", async (req, res) => {
   try {
     const { email, message = "Test notification" } = req.body;
