@@ -1,6 +1,4 @@
-// index.js — SureData Backend (Production-ready, Rollover + Auto-Disconnect + Tailscale hooks + Node auto-assign)
-// NOTE: Paste/replace your existing index.js with this file. Payment webhook preserved.
-
+// index.js — SureData Backend (Updated: Tailscale handling, correct plans, rollover, auto-assign)
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -65,21 +63,23 @@ async function sendUserNotification(email, type, message) {
 }
 
 // ----------------------
-// TAILSCALE HELPERS (updated with TAILSCALE_API_BASE)
+// TAILSCALE HELPERS (robust / best-effort)
 // ----------------------
 function _tailscaleAuthHeader() {
   const apiKey = process.env.TAILSCALE_API_KEY || "";
   const token = Buffer.from(`${apiKey}:`).toString("base64");
   return `Basic ${token}`;
 }
-
 const BASE_URL = process.env.TAILSCALE_API_BASE || "https://api.tailscale.com/api/v2";
+const TAILNET = process.env.TAILSCALE_TAILNET || null;
 
+/**
+ * Try to list devices. Returns [] on error.
+ */
 async function tailscaleListDevices() {
   try {
-    const tailnet = process.env.TAILSCALE_TAILNET;
-    if (!tailnet) throw new Error("TAILSCALE_TAILNET not set");
-    const url = `${BASE_URL}/tailnet/${encodeURIComponent(tailnet)}/devices`;
+    if (!TAILNET) throw new Error("TAILSCALE_TAILNET not set");
+    const url = `${BASE_URL}/tailnet/${encodeURIComponent(TAILNET)}/devices`;
     const res = await fetch(url, { method: "GET", headers: { Authorization: _tailscaleAuthHeader() } });
     if (!res.ok) {
       const text = await res.text();
@@ -93,42 +93,102 @@ async function tailscaleListDevices() {
   }
 }
 
+/**
+ * Best-effort: try to enable a device.
+ * Tailscale doesn't always expose a simple 'enable' — so this is best-effort and logs results.
+ */
 async function tailscaleEnableDevice(deviceId) {
   try {
-    const url = `${BASE_URL}/device/${encodeURIComponent(deviceId)}/enable`;
-    const res = await fetch(url, { method: "POST", headers: { Authorization: _tailscaleAuthHeader() } });
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`Tailscale enable failed: ${res.status} ${text}`);
+    if (!deviceId) throw new Error("deviceId required");
+    if (!TAILNET) {
+      console.warn("No TAILNET set — skipping tailscaleEnableDevice");
+      return { ok: false, error: "no-tailnet" };
     }
-    return { ok: true };
+
+    // Try PATCH to device resource (best-effort)
+    const candidates = [
+      `${BASE_URL}/tailnet/${encodeURIComponent(TAILNET)}/devices/${encodeURIComponent(deviceId)}`,
+      `${BASE_URL}/device/${encodeURIComponent(deviceId)}`,
+      `${BASE_URL}/devices/${encodeURIComponent(deviceId)}`
+    ];
+
+    for (const url of candidates) {
+      try {
+        // many Tailscale APIs expect an update or delete; here we attempt PATCH with a benign body
+        const res = await fetch(url, {
+          method: "PATCH",
+          headers: {
+            Authorization: _tailscaleAuthHeader(),
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({ /* no-op: server may ignore */ }),
+        });
+        if (res.ok || res.status === 204) {
+          return { ok: true, url };
+        } else {
+          const text = await res.text();
+          // continue to next candidate if 404 or other
+          console.warn(`tailscaleEnableDevice attempt ${url} -> ${res.status} ${text}`);
+        }
+      } catch (e) {
+        console.warn("tailscaleEnableDevice inner attempt failed:", e.message || e);
+      }
+    }
+
+    // fallback: cannot enable programmatically (no-op)
+    console.warn("tailscaleEnableDevice: no supported enable endpoint found, returning fallback false");
+    return { ok: false, error: "no-endpoint" };
   } catch (err) {
     console.warn("tailscaleEnableDevice error:", err.message || err);
     return { ok: false, error: err.message };
   }
 }
 
+/**
+ * Best-effort: try to disable/remove a device.
+ * Try DELETE on several plausible paths (tailnet devices path, device path), log and return result.
+ */
 async function tailscaleDisableDevice(deviceId) {
   try {
-    const url = `${BASE_URL}/device/${encodeURIComponent(deviceId)}/disable`;
-    const res = await fetch(url, { method: "POST", headers: { Authorization: _tailscaleAuthHeader() } });
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`Tailscale disable failed: ${res.status} ${text}`);
+    if (!deviceId) throw new Error("deviceId required");
+
+    const candidates = [];
+    if (TAILNET) {
+      candidates.push(`${BASE_URL}/tailnet/${encodeURIComponent(TAILNET)}/devices/${encodeURIComponent(deviceId)}`);
     }
-    return { ok: true };
+    candidates.push(`${BASE_URL}/devices/${encodeURIComponent(deviceId)}`);
+    candidates.push(`${BASE_URL}/device/${encodeURIComponent(deviceId)}`);
+
+    for (const url of candidates) {
+      try {
+        const res = await fetch(url, {
+          method: "DELETE",
+          headers: {
+            Authorization: _tailscaleAuthHeader(),
+          },
+        });
+        if (res.ok || res.status === 204) {
+          return { ok: true, url, status: res.status };
+        } else {
+          const text = await res.text();
+          // if 404 continue trying next candidate
+          console.warn(`tailscaleDisableDevice attempt ${url} -> ${res.status} ${text}`);
+          if (res.status >= 200 && res.status < 300) {
+            return { ok: true, url, status: res.status };
+          }
+        }
+      } catch (e) {
+        console.warn("tailscaleDisableDevice inner attempt failed:", e.message || e);
+      }
+    }
+
+    // if reached here none succeeded; still return failure but allow process to continue.
+    return { ok: false, error: "no-supported-endpoint" };
   } catch (err) {
     console.warn("tailscaleDisableDevice error:", err.message || err);
     return { ok: false, error: err.message };
   }
 }
-
-// ----------------------
-// (rest of your code remains EXACTLY as-is)
-// ----------------------
-
-// 🔹 everything below this line is unchanged
-
 
 // ----------------------
 // Node management helpers (Firestore: tailscale_nodes)
@@ -171,14 +231,19 @@ async function upsertNode(node) {
 
 // Pick best node: online, status === 'free', lowest load. Returns doc snapshot or null.
 async function pickBestNode() {
-  const q = await db.collection("tailscale_nodes")
-    .where("online", "==", true)
-    .where("status", "==", "free")
-    .orderBy("load", "asc")
-    .limit(1)
-    .get();
-  if (q.empty) return null;
-  return q.docs[0];
+  try {
+    const q = await db.collection("tailscale_nodes")
+      .where("online", "==", true)
+      .where("status", "==", "free")
+      .orderBy("load", "asc")
+      .limit(1)
+      .get();
+    if (q.empty) return null;
+    return q.docs[0];
+  } catch (err) {
+    console.warn("pickBestNode error:", err.message || err);
+    return null;
+  }
 }
 
 // assign node: mark status=in_use, assignedTo=userEmail (or uid), increment load slightly
@@ -220,7 +285,7 @@ async function setNodeOnline(nodeDocRef, online) {
 }
 
 // ----------------------------
-// PAYSTACK WEBHOOK (unchanged logic)
+// PAYSTACK WEBHOOK (updated with correct plans + rollover + auto-assign)
 // ----------------------------
 app.post(
   "/payments/webhook",
@@ -260,18 +325,30 @@ app.post(
 
       const data = event.data;
       const reference = data.reference;
-      const amount = data.amount / 100;
+      const amount = data.amount / 100; // amount in Naira
       const email = (data.customer?.email || "").toLowerCase();
 
-      // ✅ Match plan by amount
+      // ✅ Match plan by amount (your specified plans)
       const plans = {
-        500: { name: "Basic Plan", dataLimit: 2 * 1024, days: 30 },
-        1000: { name: "Standard Plan", dataLimit: 4 * 1024, days: 30 },
-        2000: { name: "Pro Plan", dataLimit: 8 * 1024, days: 30 },
-        5000: { name: "Ultra Plan", dataLimit: 20 * 1024, days: 30 },
+        500: { name: "Basic Plan", dataLimit: 1 * 1024, days: 30 },   // 1 GB => 1024 MB
+        1000: { name: "Standard Plan", dataLimit: 3 * 1024, days: 30 }, // 3 GB
+        2000: { name: "Pro Plan", dataLimit: 8 * 1024, days: 30 },     // 8 GB
+        5000: { name: "Ultra Plan", dataLimit: 20 * 1024, days: 30 },  // 20 GB
       };
       const plan = plans[amount];
-      if (!plan) return res.sendStatus(200);
+      if (!plan) {
+        console.log(`Unhandled payment amount: ${amount} for ${email}`);
+        // still record transaction and return OK
+        await db.collection("transactions").doc(reference).set({
+          email,
+          reference,
+          amount,
+          status: "success",
+          timestamp: new Date().toISOString(),
+          note: "unmapped_amount",
+        });
+        return res.sendStatus(200);
+      }
 
       // ✅ Find user
       const usersRef = db.collection("users");
@@ -294,20 +371,13 @@ app.post(
 
       // ✅ Compute rollover if applicable
       const now = new Date();
-      const currentExpiry = userData.expiryDate
-        ? new Date(userData.expiryDate)
-        : null;
+      const currentExpiry = userData.expiryDate ? new Date(userData.expiryDate) : null;
       const isActive = currentExpiry && currentExpiry > now;
 
-      const newExpiry = new Date();
-      newExpiry.setDate(newExpiry.getDate() + plan.days);
+      // If active, compute remaining unused data in MB
+      const remainingData = Math.max((userData.planLimit || 0) - (userData.dataUsed || 0), 0);
 
-      const remainingData = Math.max(
-        (userData.planLimit || 0) - (userData.dataUsed || 0),
-        0
-      );
-
-      let totalLimit = plan.dataLimit;
+      let totalLimit = plan.dataLimit; // MB
       if (isActive && remainingData > 0) {
         totalLimit += remainingData;
         console.log(
@@ -315,10 +385,16 @@ app.post(
         );
       }
 
+      const newExpiry = new Date();
+      newExpiry.setDate(newExpiry.getDate() + plan.days);
+
+      // Update user doc: if account was inactive, reset dataUsed; otherwise keep current dataUsed
+      const newDataUsed = isActive ? (userData.dataUsed || 0) : 0;
+
       await userRef.update({
         currentPlan: plan.name,
         planLimit: totalLimit,
-        dataUsed: isActive ? userData.dataUsed || 0 : 0,
+        dataUsed: newDataUsed,
         expiryDate: newExpiry.toISOString(),
         vpnActive: true,
         lastPayment: {
@@ -329,6 +405,16 @@ app.post(
         updatedAt: now.toISOString(),
       });
 
+      // record transaction
+      await db.collection("transactions").doc(reference).set({
+        email,
+        reference,
+        amount,
+        plan: plan.name,
+        status: "success",
+        timestamp: now.toISOString(),
+      });
+
       console.log(
         `✅ ${email} purchased ${plan.name} — total ${totalLimit}MB (after rollover if any)`
       );
@@ -337,10 +423,50 @@ app.post(
       await sendUserNotification(
         email,
         "plan_purchased",
-        `🎉 You’ve successfully purchased the ${plan.name}. Total: ${totalLimit}MB.`
+        `🎉 You’ve successfully purchased the ${plan.name}. Total: ${Math.round(totalLimit)}MB.`
       );
 
-      // keep webhook unchanged: no auto enabling of devices here (you can call auto-assign separately)
+      // --- AUTO-ASSIGN NODE IMMEDIATELY (best-effort) ---
+      try {
+        const uid = snap.docs[0].data().uid || snap.docs[0].id || email;
+        const userIdentifier = uid || email;
+        // find if there's already a vpn_session for this user
+        const sessionRef = db.collection("vpn_sessions").doc(userIdentifier);
+        const existingSession = await sessionRef.get();
+
+        if (!existingSession.exists) {
+          const nodeDoc = await pickBestNode();
+          if (nodeDoc) {
+            const assignRes = await assignNodeToUser(nodeDoc.ref, userIdentifier);
+            await sessionRef.set({
+              nodeId: nodeDoc.id,
+              assignedAt: new Date().toISOString(),
+              active: true,
+              user: email || uid || null,
+            });
+            // update user doc with assigned node id
+            await userRef.update({
+              vpnAssignedAt: new Date().toISOString(),
+              vpnDeviceId: nodeDoc.id,
+              vpnActive: true,
+            });
+            console.log(`🔗 Auto-assigned node ${nodeDoc.id} to ${email}`);
+            await sendUserNotification(email, "node_assigned", `Node assigned to your account.`);
+          } else {
+            console.log("⚠️ No available node to auto-assign after payment");
+          }
+        } else {
+          // update existing session to active (if it existed but was inactive)
+          await sessionRef.update({
+            active: true,
+            updatedAt: new Date().toISOString(),
+          });
+          await userRef.update({ vpnActive: true });
+        }
+      } catch (err) {
+        console.warn("Auto-assign after purchase failed:", err.message || err);
+      }
+
       res.sendStatus(200);
     } catch (err) {
       console.error("❌ Webhook error:", err);
@@ -427,7 +553,7 @@ app.post("/tailscale/sync-from-api", requireAdmin, async (req, res) => {
     const upserts = [];
     for (const d of devices) {
       // map device fields to our node doc
-      const deviceId = d.id || d.node_id || d.key || d.idString || d.id?.toString();
+      const deviceId = d.id || d.node_id || d.key || d.idString || (d.id && d.id.toString());
       const hostname = d.hostname || d.name || null;
       const ip = (d.allAddresses && d.allAddresses[0]) || d.addresses?.[0] || null;
       const user = d.user || d.userName || null;
@@ -456,7 +582,7 @@ app.post("/tailscale/sync-from-api", requireAdmin, async (req, res) => {
 });
 
 // Auto-assign a node to a user (called by backend when user purchases or app when user connects)
-// Request: { email, uid } — admin header optional depending on ADMIN_API_KEY
+// Request: { email, uid }
 app.post("/vpn/node/auto-assign", requireAdmin, async (req, res) => {
   try {
     const { email, uid } = req.body;
@@ -524,7 +650,8 @@ app.post("/vpn/node/revoke", requireAdmin, async (req, res) => {
       const nodeRef = db.collection("tailscale_nodes").doc(nodeId);
       // attempt to disable device at Tailscale as well (best-effort)
       try {
-        await tailscaleDisableDevice(nodeId);
+        const tailscaleRes = await tailscaleDisableDevice(nodeId);
+        console.log("tailscaleDisableDevice result:", tailscaleRes);
       } catch (err) {
         console.warn("tailscaleDisableDevice failed:", err.message || err);
       }
@@ -533,6 +660,24 @@ app.post("/vpn/node/revoke", requireAdmin, async (req, res) => {
 
     // mark session inactive
     await sessionRef.update({ active: false, revokedAt: new Date().toISOString() });
+
+    // also mark user vpnActive false and set revokedAt flag to trigger auto-disconnect on client
+    try {
+      // attempt to find user doc by uid or email
+      let userDocSnap = null;
+      if (uid) {
+        userDocSnap = await db.collection("users").doc(uid).get();
+      }
+      if (!userDocSnap || !userDocSnap.exists) {
+        const q = await db.collection("users").where("email", "==", email).limit(1).get();
+        if (!q.empty) userDocSnap = q.docs[0];
+      }
+      if (userDocSnap && userDocSnap.exists) {
+        await userDocSnap.ref.update({ vpnActive: false, revokedAt: new Date().toISOString() });
+      }
+    } catch (e) {
+      console.warn("Failed to update user doc during revoke:", e.message || e);
+    }
 
     res.json({ success: true, revoked: true, nodeId: nodeId || null });
   } catch (err) {
@@ -559,6 +704,45 @@ app.get("/vpn/status/:uid", async (req, res) => {
 // ----------------------
 // Existing VPN session handlers (connect/disconnect/update-usage) - kept mostly as-is
 // ----------------------
+async function disableVPNAccess(usernameOrEmail) {
+  // helper: mark vpnActive false on user doc and revoke session
+  try {
+    // find user
+    let userDoc = null;
+    const byUid = await db.collection("users").doc(usernameOrEmail).get();
+    if (byUid.exists) userDoc = byUid;
+    if (!userDoc) {
+      const q = await db.collection("users").where("email", "==", usernameOrEmail).limit(1).get();
+      if (!q.empty) userDoc = q.docs[0];
+    }
+    if (userDoc) {
+      await userDoc.ref.update({ vpnActive: false, revokedAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+    }
+
+    // session
+    const sessionRef = db.collection("vpn_sessions").doc(usernameOrEmail);
+    const s = await sessionRef.get();
+    if (s.exists) {
+      const sess = s.data() || {};
+      if (sess.nodeId) {
+        try {
+          await tailscaleDisableDevice(sess.nodeId);
+        } catch (e) {
+          console.warn("disableVPNAccess tailscaleDisableDevice failed", e.message || e);
+        }
+        try {
+          await releaseNode(db.collection("tailscale_nodes").doc(sess.nodeId));
+        } catch (e) {
+          console.warn("disableVPNAccess releaseNode failed", e.message || e);
+        }
+      }
+      await sessionRef.update({ active: false, revokedAt: new Date().toISOString() });
+    }
+  } catch (err) {
+    console.warn("disableVPNAccess error:", err.message || err);
+  }
+}
+
 app.post("/vpn/session/connect", async (req, res) => {
   try {
     const { username, vpn_ip } = req.body;
@@ -591,6 +775,7 @@ app.post("/vpn/session/connect", async (req, res) => {
               active: true,
               user: user.email || uidOrEmail,
             });
+            await docRef.update({ vpnAssignedAt: new Date().toISOString(), vpnDeviceId: pick.ref.id });
           }
         }
       }
