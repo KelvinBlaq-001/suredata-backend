@@ -740,10 +740,9 @@ app.get("/vpn/status/:uid", async (req, res) => {
 // ----------------------
 // Existing VPN session handlers (connect/disconnect/update-usage) - kept mostly as-is
 // ----------------------
+// Safe disableVPNAccess helper
 async function disableVPNAccess(usernameOrEmail) {
-  // helper: mark vpnActive false on user doc and revoke session
   try {
-    // find user
     let userDoc = null;
     const byUid = await db.collection("users").doc(usernameOrEmail).get();
     if (byUid.exists) userDoc = byUid;
@@ -751,26 +750,23 @@ async function disableVPNAccess(usernameOrEmail) {
       const q = await db.collection("users").where("email", "==", usernameOrEmail).limit(1).get();
       if (!q.empty) userDoc = q.docs[0];
     }
-    if (userDoc) {
-      await userDoc.ref.update({ vpnActive: false, revokedAt: new Date().toISOString(), updatedAt: new Date().toISOString() });
+
+    if (userDoc && userDoc.exists && userDoc.data().vpnActive) {
+      await userDoc.ref.update({
+        vpnActive: false,
+        revokedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      console.log(`🛑 VPN access disabled for ${usernameOrEmail}`);
     }
 
-    // session
     const sessionRef = db.collection("vpn_sessions").doc(usernameOrEmail);
     const s = await sessionRef.get();
     if (s.exists) {
       const sess = s.data() || {};
       if (sess.nodeId) {
-        try {
-          await tailscaleDisableDevice(sess.nodeId);
-        } catch (e) {
-          console.warn("disableVPNAccess tailscaleDisableDevice failed", e.message || e);
-        }
-        try {
-          await releaseNode(db.collection("tailscale_nodes").doc(sess.nodeId));
-        } catch (e) {
-          console.warn("disableVPNAccess releaseNode failed", e.message || e);
-        }
+        try { await tailscaleDisableDevice(sess.nodeId); } catch {}
+        try { await releaseNode(db.collection("tailscale_nodes").doc(sess.nodeId)); } catch {}
       }
       await sessionRef.update({ active: false, revokedAt: new Date().toISOString() });
     }
@@ -779,44 +775,38 @@ async function disableVPNAccess(usernameOrEmail) {
   }
 }
 
+// Connect endpoint
 app.post("/vpn/session/connect", async (req, res) => {
   try {
     const { username, vpn_ip } = req.body;
     const snap = await db.collection("users").where("email", "==", username).limit(1).get();
     if (snap.empty) return res.status(404).json({ error: "User not found" });
-
     const docRef = snap.docs[0].ref;
+
     await docRef.update({
       vpnActive: true,
       vpnIP: vpn_ip,
       lastConnect: new Date().toISOString(),
     });
 
-    // optional: ensure tailscale device enabled when user connects (try to use stored vpnDeviceId)
-    try {
-      const user = snap.docs[0].data();
-      if (user && user.vpnDeviceId) {
-        await tailscaleEnableDevice(user.vpnDeviceId);
-      } else {
-        // attempt to auto-assign a node if none assigned (best-effort)
-        const uidOrEmail = user.uid || user.email;
-        const existingSession = await db.collection("vpn_sessions").doc(uidOrEmail).get();
-        if (!existingSession.exists) {
-          const pick = await pickBestNode();
-          if (pick) {
-            await assignNodeToUser(pick.ref, uidOrEmail);
-            await db.collection("vpn_sessions").doc(uidOrEmail).set({
-              nodeId: pick.ref.id,
-              assignedAt: new Date().toISOString(),
-              active: true,
-              user: user.email || uidOrEmail,
-            });
-            await docRef.update({ vpnAssignedAt: new Date().toISOString(), vpnDeviceId: pick.ref.id });
-          }
-        }
+    const user = snap.docs[0].data();
+    if (user?.vpnDeviceId) await tailscaleEnableDevice(user.vpnDeviceId);
+
+    // auto-assign node if none
+    const uidOrEmail = user.uid || user.email;
+    const existingSession = await db.collection("vpn_sessions").doc(uidOrEmail).get();
+    if (!existingSession.exists) {
+      const pick = await pickBestNode();
+      if (pick) {
+        await assignNodeToUser(pick.ref, uidOrEmail);
+        await db.collection("vpn_sessions").doc(uidOrEmail).set({
+          nodeId: pick.ref.id,
+          assignedAt: new Date().toISOString(),
+          active: true,
+          user: user.email || uidOrEmail,
+        });
+        await docRef.update({ vpnAssignedAt: new Date().toISOString(), vpnDeviceId: pick.ref.id });
       }
-    } catch (err) {
-      console.warn("connect: tailscale enable attempt failed:", err.message || err);
     }
 
     res.json({ success: true });
@@ -826,14 +816,13 @@ app.post("/vpn/session/connect", async (req, res) => {
   }
 });
 
+// Disconnect endpoint
 app.post("/vpn/session/disconnect", async (req, res) => {
   try {
     const { username, data_used_mb = 0 } = req.body;
     const snap = await db.collection("users").where("email", "==", username).limit(1).get();
     if (snap.empty) return res.status(404).json({ error: "User not found" });
-
-    const doc = snap.docs[0];
-    const u = doc.data();
+    const doc = snap.docs[0]; const u = doc.data();
     const used = (u.dataUsed || 0) + data_used_mb;
     const over = used >= (u.planLimit || Infinity);
     const expired = u.expiryDate && new Date(u.expiryDate) < new Date();
@@ -846,15 +835,8 @@ app.post("/vpn/session/disconnect", async (req, res) => {
     });
 
     if (over || expired) {
-      // disable both local VPN and tailscale device
       await disableVPNAccess(username);
-      await sendUserNotification(
-        username,
-        "plan_exhausted",
-        expired
-          ? "Your plan has expired. Please renew."
-          : "Your data limit has been exhausted."
-      );
+      await sendUserNotification(username, "plan_exhausted", expired ? "Your plan expired" : "Data limit exhausted");
     }
 
     res.json({ success: true });
@@ -864,43 +846,27 @@ app.post("/vpn/session/disconnect", async (req, res) => {
   }
 });
 
+// Update usage
 app.post("/vpn/session/update-usage", async (req, res) => {
   try {
     const { username, usage_mb = 0 } = req.body;
     const snap = await db.collection("users").where("email", "==", username).limit(1).get();
     if (snap.empty) return res.status(404).json({ error: "User not found" });
-
-    const doc = snap.docs[0];
-    const u = doc.data();
+    const doc = snap.docs[0]; const u = doc.data();
     const used = (u.dataUsed || 0) + usage_mb;
     const percent = (used / (u.planLimit || 1)) * 100;
 
-    if (percent >= 90 && percent < 100) {
-      await sendUserNotification(
-        username,
-        "plan_near_limit",
-        `⚠️ You've used ${percent.toFixed(0)}% of your plan.`
-      );
-    }
+    if (percent >= 90 && percent < 100)
+      await sendUserNotification(username, "plan_near_limit", `⚠️ You've used ${percent.toFixed(0)}% of your plan.`);
 
     const over = used >= (u.planLimit || Infinity);
     const expired = u.expiryDate && new Date(u.expiryDate) < new Date();
 
-    await doc.ref.update({
-      dataUsed: used,
-      vpnActive: !over && !expired,
-      updatedAt: new Date().toISOString(),
-    });
+    await doc.ref.update({ dataUsed: used, vpnActive: !over && !expired, updatedAt: new Date().toISOString() });
 
     if (over || expired) {
       await disableVPNAccess(username);
-      await sendUserNotification(
-        username,
-        "plan_exhausted",
-        over
-          ? "🚫 Your data plan has been exhausted."
-          : "⌛ Your plan has expired."
-      );
+      await sendUserNotification(username, "plan_exhausted", over ? "🚫 Data exhausted" : "⌛ Plan expired");
     }
 
     res.json({ success: true });
@@ -909,6 +875,7 @@ app.post("/vpn/session/update-usage", async (req, res) => {
     res.status(500).json({ error: err.message });
   }
 });
+
 
 // ----------------------
 // --- ✅ AUTO ACTIVATE PENDING PLAN ON EXPIRY ---
