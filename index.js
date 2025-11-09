@@ -1,4 +1,4 @@
-// index.js — SureData Backend (Production-ready, Plan buckets, Auto-assign, Canonical sessions)
+// index.js — SureData Backend (Production-ready, Plan buckets, Canonical sessions, auto-assign disabled)
 
 import express from "express";
 import cors from "cors";
@@ -289,9 +289,6 @@ async function setNodeOnline(nodeDocRef, online) {
 // Plan bucket helpers
 // ----------------------
 
-/**
- * Compute total remaining MB from plan buckets array.
- */
 function computeTotalRemainingFromPlans(plans = []) {
   if (!Array.isArray(plans)) return 0;
   return plans.reduce((sum, p) => {
@@ -300,27 +297,19 @@ function computeTotalRemainingFromPlans(plans = []) {
   }, 0);
 }
 
-/**
- * Normalize a user identifier (prefer email lowercased if available).
- * If given a possibly-empty email, returns email.toLowerCase().
- * If no email, falls back to uid as string lowercased.
- */
 function canonicalIdentifierFromEmailOrUid(emailOrUid) {
   if (!emailOrUid) return null;
   return String(emailOrUid).toLowerCase();
 }
 
-/**
- * Append a plan bucket to user doc and update totalDataDisplay + expiry/summary fields.
- */
 async function appendPlanBucketForUser(userRef, bucket) {
-  // Add the bucket
+  // Append bucket using arrayUnion (safe for concurrent writes).
   await userRef.update({
     plans: admin.firestore.FieldValue.arrayUnion(bucket),
     updatedAt: new Date().toISOString(),
   });
 
-  // Recompute summary fields
+  // Recompute summary fields after append
   const snap = await userRef.get();
   const u = snap.exists ? snap.data() : {};
   const plans = u.plans || [];
@@ -334,7 +323,7 @@ async function appendPlanBucketForUser(userRef, bucket) {
 
   await userRef.update({
     totalDataDisplay: totalRemaining,
-    planLimit: totalRemaining, // legacy/backwards-compat convenience
+    planLimit: totalRemaining,
     expiryDate: earliestExpiry ? earliestExpiry.toISOString() : admin.firestore.FieldValue.delete(),
     updatedAt: new Date().toISOString(),
   });
@@ -342,14 +331,6 @@ async function appendPlanBucketForUser(userRef, bucket) {
   return { totalRemaining, plans };
 }
 
-/**
- * Consume usageMB from user's plan buckets (earliest expiry first).
- * userRef: DocumentReference to user doc.
- * usageMB: number of MB to consume. (integer)
- *
- * Returns: { exhausted: boolean, totalRemaining: number, updatedPlans: array }
- * - exhausted = true when usageMB exceeds total available (some amount couldn't be consumed)
- */
 async function consumeFromPlanBuckets(userRef, usageMB) {
   const snap = await userRef.get();
   if (!snap.exists) return { error: "user_not_found" };
@@ -358,7 +339,6 @@ async function consumeFromPlanBuckets(userRef, usageMB) {
   const u = snap.data() || {};
   let plans = Array.isArray(u.plans) ? [...u.plans] : [];
 
-  // Normalize fields on each plan: ensure remainingMB present
   plans = plans.map((p) => ({
     name: p.name,
     dataLimitMB: Number(p.dataLimitMB || p.dataLimit || 0),
@@ -367,14 +347,12 @@ async function consumeFromPlanBuckets(userRef, usageMB) {
     purchasedAt: p.purchasedAt || p.purchasedAt || null,
   }));
 
-  // Remove expired buckets up-front
   plans = plans.filter((p) => {
-    if (!p.expiry) return true; // no expiry -> keep
+    if (!p.expiry) return true;
     const exp = new Date(p.expiry);
     return exp > now && (p.remainingMB || 0) > 0;
   });
 
-  // Sort by expiry ascending (null/undefined expiry goes last)
   plans.sort((a, b) => {
     if (!a.expiry && !b.expiry) return 0;
     if (!a.expiry) return 1;
@@ -391,10 +369,8 @@ async function consumeFromPlanBuckets(userRef, usageMB) {
     remainingToConsume -= take;
   }
 
-  // Remove buckets that are now zero
   plans = plans.filter((p) => Number(p.remainingMB || 0) > 0);
 
-  // Recompute totals and update user doc
   const totalRemaining = computeTotalRemainingFromPlans(plans);
   const earliestExpiry = plans.length
     ? plans
@@ -406,7 +382,7 @@ async function consumeFromPlanBuckets(userRef, usageMB) {
   await userRef.update({
     plans,
     totalDataDisplay: totalRemaining,
-    planLimit: totalRemaining, // legacy convenience
+    planLimit: totalRemaining,
     expiryDate: earliestExpiry ? earliestExpiry.toISOString() : admin.firestore.FieldValue.delete(),
     updatedAt: new Date().toISOString(),
   });
@@ -419,9 +395,6 @@ async function consumeFromPlanBuckets(userRef, usageMB) {
   };
 }
 
-/**
- * Purge expired buckets (used by cron). Returns remaining total.
- */
 async function purgeExpiredBucketsForUser(userRef) {
   const snap = await userRef.get();
   if (!snap.exists) return { totalRemaining: 0 };
@@ -454,7 +427,7 @@ async function purgeExpiredBucketsForUser(userRef) {
 }
 
 // ----------------------------
-// PAYSTACK WEBHOOK (updated with plan-buckets + immediate auto-assign)
+// PAYSTACK WEBHOOK (plan-buckets, migration of legacy fields, auto-assign REMOVED)
 // ----------------------------
 app.post(
   "/payments/webhook",
@@ -533,8 +506,100 @@ app.post(
       const userRef = snap.docs[0].ref;
       const userData = snap.docs[0].data();
 
-      // Build a new bucket
+      // Save transaction record
       const now = new Date();
+      await db.collection("transactions").doc(reference).set({
+        email,
+        reference,
+        amount,
+        plan: plan.name,
+        status: "success",
+        timestamp: now.toISOString(),
+      });
+
+      // --- MIGRATE LEGACY FIELDS INTO plans[] IF NEEDED ---
+      // If userData has legacy currentPlan/pendingPlan/planLimit etc but doesn't have equivalent plans array entries,
+      // convert them into plan buckets so totalDataDisplay will reflect real total.
+      try {
+        const existingPlans = Array.isArray(userData.plans) ? [...userData.plans] : [];
+        const migrationBuckets = [];
+
+        // migrate currentPlan if it exists and not represented in plans
+        if (userData.currentPlan && (userData.planLimit || 0) > 0) {
+          // check if an equivalent plan already present (by name + expiry)
+          const present = existingPlans.some((p) => {
+            if (!p) return false;
+            return (
+              String(p.name || "").toLowerCase() === String(userData.currentPlan || "").toLowerCase()
+            );
+          });
+          if (!present) {
+            const rem = Math.max((userData.planLimit || 0) - (userData.dataUsed || 0), 0);
+            migrationBuckets.push({
+              name: userData.currentPlan || "Legacy Plan",
+              dataLimitMB: Number(userData.planLimit || 0),
+              remainingMB: Number(rem),
+              purchasedAt: userData.lastPayment?.date || new Date().toISOString(),
+              expiry: userData.expiryDate || null,
+            });
+          }
+        }
+
+        // migrate pendingPlan (legacy) into a bucket (we will keep rollover behavior by storing it as a separate bucket)
+        if (userData.pendingPlan && userData.pendingPlan.dataLimit) {
+          const p = userData.pendingPlan;
+          const presentPending = existingPlans.some((ep) => {
+            if (!ep) return false;
+            return (
+              String(ep.name || "").toLowerCase() === String(p.name || "").toLowerCase() &&
+              Number(ep.dataLimitMB || ep.dataLimit || 0) === Number(p.dataLimit || 0)
+            );
+          });
+          if (!presentPending) {
+            const expiry = p.expiryDate || p.expiry || null;
+            migrationBuckets.push({
+              name: p.name || "Pending Plan",
+              dataLimitMB: Number(p.dataLimit || 0),
+              remainingMB: Number(p.dataLimit || 0),
+              purchasedAt: p.purchasedAt || new Date().toISOString(),
+              expiry,
+            });
+          }
+        }
+
+        if (migrationBuckets.length > 0) {
+          const mergedPlans = [...existingPlans, ...migrationBuckets];
+          const totalRemaining = computeTotalRemainingFromPlans(mergedPlans);
+          const earliestExpiry = mergedPlans.length
+            ? mergedPlans
+                .map((p) => (p.expiry ? new Date(p.expiry) : null))
+                .filter(Boolean)
+                .sort((a, b) => a - b)[0]
+            : null;
+
+          // overwrite plans array to include migrated buckets
+          await userRef.update({
+            plans: mergedPlans,
+            totalDataDisplay: totalRemaining,
+            planLimit: totalRemaining,
+            expiryDate: earliestExpiry ? earliestExpiry.toISOString() : admin.firestore.FieldValue.delete(),
+            // clear legacy pendingPlan/currentPlan to avoid duplicate-migrations later
+            pendingPlan: admin.firestore.FieldValue.delete(),
+            currentPlan: admin.firestore.FieldValue.delete(),
+            dataUsed: admin.firestore.FieldValue.delete(), // we'll manage usage via buckets
+            updatedAt: new Date().toISOString(),
+          });
+
+          console.log(`Migrated legacy plan/pendingPlan into plans[] for ${email}`, {
+            migrated: migrationBuckets.length,
+            totalRemaining,
+          });
+        }
+      } catch (e) {
+        console.warn("Plan migration failed (non-fatal):", e.message || e);
+      }
+
+      // --- Build & append new bucket for this purchase ---
       const newExpiry = new Date();
       newExpiry.setDate(newExpiry.getDate() + plan.days);
 
@@ -546,22 +611,11 @@ app.post(
         expiry: newExpiry.toISOString(),
       };
 
-      // Save transaction record
-      await db.collection("transactions").doc(reference).set({
-        email,
-        reference,
-        amount,
-        plan: plan.name,
-        status: "success",
-        timestamp: now.toISOString(),
-      });
-
-      // Append bucket and compute summary
       try {
         const appendRes = await appendPlanBucketForUser(userRef, bucket);
         console.log(`✅ Appended plan bucket for ${email}. totalRemaining=${appendRes.totalRemaining}`);
 
-        // Mark user vpnActive true and update lastPayment
+        // Mark user vpnActive true and update lastPayment (legacy convenience)
         await userRef.update({
           vpnActive: true,
           lastPayment: { amount, reference, date: now.toISOString() },
@@ -578,37 +632,8 @@ app.post(
         console.warn("Failed to append plan bucket:", e.message || e);
       }
 
-      // --- AUTO-ASSIGN NODE IMMEDIATELY AFTER PAYMENT (best-effort) ---
-      try {
-        const userIdentifier = canonicalIdentifierFromEmailOrUid(email);
-        const sessionRef = db.collection("vpn_sessions").doc(userIdentifier);
-        const existingSession = await sessionRef.get();
-        if (!existingSession.exists || !existingSession.data().active) {
-          const nodeDoc = await pickBestNode();
-          if (nodeDoc) {
-            await assignNodeToUser(nodeDoc.ref, userIdentifier);
-            await sessionRef.set({
-              nodeId: nodeDoc.id,
-              assignedAt: new Date().toISOString(),
-              active: true,
-              user: email,
-            });
-            await userRef.update({
-              vpnAssignedAt: new Date().toISOString(),
-              vpnDeviceId: nodeDoc.id,
-              vpnActive: true,
-            });
-            console.log(`🔗 Node ${nodeDoc.id} assigned to ${email} after purchase`);
-            await sendUserNotification(email, "node_assigned", "A node has been assigned to your account.");
-          } else {
-            console.log("⚠️ No available node to auto-assign after payment");
-          }
-        } else {
-          console.log(`🔒 ${email} already has an active VPN session — skipped auto-assign.`);
-        }
-      } catch (e) {
-        console.warn("Auto-assign after purchase failed:", e.message || e);
-      }
+      // NOTE: automatic node assignment was intentionally REMOVED here to avoid errors.
+      // If you want manual assignment, use the /vpn/node/auto-assign endpoint.
 
       return res.sendStatus(200);
     } catch (err) {
@@ -646,7 +671,6 @@ app.get("/admin/summary", async (_, res) => {
       total++;
       const u = doc.data();
       if (u.vpnActive) active++;
-      // treat expiryDate as earliest plan expiry (we keep it updated)
       if (u.expiryDate && new Date(u.expiryDate) < now) expired++;
       if (u.plans && u.plans.length) withPlan++;
     });
@@ -662,18 +686,15 @@ app.get("/admin/summary", async (_, res) => {
 // Tailscale & Node Endpoints
 // ----------------------
 
-// Seed nodes from a JSON array in request body (admin)
+// Seed nodes (admin)
 app.post("/tailscale/seed-nodes", requireAdmin, async (req, res) => {
   try {
-    const nodes = req.body.nodes; // expect array of {deviceId, hostname, ip, user}
-    if (!Array.isArray(nodes))
-      return res.status(400).json({ error: "nodes array required" });
+    const nodes = req.body.nodes;
+    if (!Array.isArray(nodes)) return res.status(400).json({ error: "nodes array required" });
 
     const results = [];
     for (const n of nodes) {
-      const did =
-        n.deviceId ||
-        (n.hostname ? n.hostname.replace(/\s+/g, "-").toLowerCase() : null);
+      const did = n.deviceId || (n.hostname ? n.hostname.replace(/\s+/g, "-").toLowerCase() : null);
       await upsertNode({
         deviceId: did,
         hostname: n.hostname,
@@ -693,7 +714,7 @@ app.post("/tailscale/seed-nodes", requireAdmin, async (req, res) => {
   }
 });
 
-// Cron-like: sync nodes from Tailscale API into tailscale_nodes collection (admin)
+// Tailscale sync (admin)
 app.post("/tailscale/sync-from-api", requireAdmin, async (req, res) => {
   try {
     const devices = await tailscaleListDevices();
@@ -727,23 +748,18 @@ app.post("/tailscale/sync-from-api", requireAdmin, async (req, res) => {
   }
 });
 
-// Auto-assign a node to a user (called by backend when user purchases or app when user connects)
-// Request: { email, uid } — admin header optional depending on ADMIN_API_KEY
+// Manual auto-assign endpoint remains (admin-controlled)
 app.post("/vpn/node/auto-assign", requireAdmin, async (req, res) => {
   try {
     const { email, uid } = req.body;
     const rawIdentifier = uid || email;
-    if (!rawIdentifier)
-      return res.status(400).json({ error: "email or uid required" });
+    if (!rawIdentifier) return res.status(400).json({ error: "email or uid required" });
 
     const userIdentifier = canonicalIdentifierFromEmailOrUid(rawIdentifier);
 
-    // pick best node
     const nodeDoc = await pickBestNode();
     if (!nodeDoc) {
-      // fallback: try to pick any online node
-      const alt = await db
-        .collection("tailscale_nodes")
+      const alt = await db.collection("tailscale_nodes")
         .where("online", "==", true)
         .orderBy("load", "asc")
         .limit(1)
@@ -753,7 +769,6 @@ app.post("/vpn/node/auto-assign", requireAdmin, async (req, res) => {
       } else {
         const docRef = alt.docs[0].ref;
         const r = await assignNodeToUser(docRef, userIdentifier);
-        // create vpn_sessions record
         await db.collection("vpn_sessions").doc(userIdentifier).set({
           nodeId: docRef.id,
           assignedAt: new Date().toISOString(),
@@ -767,7 +782,6 @@ app.post("/vpn/node/auto-assign", requireAdmin, async (req, res) => {
     const docRef = nodeDoc.ref;
     const assignRes = await assignNodeToUser(docRef, userIdentifier);
 
-    // Save session
     await db.collection("vpn_sessions").doc(userIdentifier).set({
       nodeId: docRef.id,
       assignedAt: new Date().toISOString(),
@@ -782,32 +796,17 @@ app.post("/vpn/node/auto-assign", requireAdmin, async (req, res) => {
   }
 });
 
-// Revoke node for a user (unassign)
-// Request: { email or uid }
+// Revoke node (admin)
 app.post("/vpn/node/revoke", requireAdmin, async (req, res) => {
   try {
-    // audit log (light)
-    console.log("/vpn/node/revoke called", {
-      authKeyPresent: !!req.headers["x-admin-key"],
-      ip: req.ip || req.headers["x-forwarded-for"] || null,
-      bodyPreview: {
-        email: req.body?.email || null,
-        uid: req.body?.uid || null,
-      },
-      time: new Date().toISOString(),
-    });
-
     const { email, uid } = req.body;
     const rawIdentifier = uid || email;
-    if (!rawIdentifier)
-      return res.status(400).json({ error: "email or uid required" });
+    if (!rawIdentifier) return res.status(400).json({ error: "email or uid required" });
 
     const userIdentifier = canonicalIdentifierFromEmailOrUid(rawIdentifier);
-
     const sessionRef = db.collection("vpn_sessions").doc(userIdentifier);
     const sessionSnap = await sessionRef.get();
-    if (!sessionSnap.exists)
-      return res.status(404).json({ error: "No active session for user" });
+    if (!sessionSnap.exists) return res.status(404).json({ error: "No active session for user" });
 
     const session = sessionSnap.data() || {};
     const nodeId = session.nodeId;
@@ -820,32 +819,22 @@ app.post("/vpn/node/revoke", requireAdmin, async (req, res) => {
       } catch (err) {
         console.warn("tailscaleDisableDevice failed:", err?.message || err);
       }
-
       try {
         await releaseNode(nodeRef);
-        console.log(`Released node ${nodeId} in Firestore for ${userIdentifier}`);
       } catch (err) {
         console.warn("releaseNode failed:", err?.message || err);
       }
-    } else {
-      console.log(`No nodeId found in session for ${userIdentifier} — nothing to release`);
     }
 
-    // mark session inactive
     await sessionRef.update({ active: false, revokedAt: new Date().toISOString() });
 
-    // also mark user vpnActive false and set revokedAt flag
     try {
       let userDocSnap = null;
       if (uid) {
         userDocSnap = await db.collection("users").doc(uid).get();
       }
       if (!userDocSnap || !userDocSnap.exists) {
-        const q = await db
-          .collection("users")
-          .where("email", "==", email)
-          .limit(1)
-          .get();
+        const q = await db.collection("users").where("email", "==", email).limit(1).get();
         if (!q.empty) userDocSnap = q.docs[0];
       }
       if (userDocSnap && userDocSnap.exists) {
@@ -875,9 +864,7 @@ app.get("/vpn/status/:uid", async (req, res) => {
     const snap = await db.collection("vpn_sessions").doc(uid).get();
     if (!snap.exists) return res.json({ active: false });
     const s = snap.data() || {};
-    const node = s.nodeId
-      ? (await db.collection("tailscale_nodes").doc(s.nodeId).get()).data()
-      : null;
+    const node = s.nodeId ? (await db.collection("tailscale_nodes").doc(s.nodeId).get()).data() : null;
     res.json({ active: !!s.active, session: s, node });
   } catch (err) {
     console.error("/vpn/status error:", err.message || err);
@@ -886,20 +873,15 @@ app.get("/vpn/status/:uid", async (req, res) => {
 });
 
 // ----------------------
-// Existing VPN session handlers (connect/disconnect/update-usage)
+// VPN session handlers (connect/disconnect/update-usage)
 // ----------------------
 async function disableVPNAccess(usernameOrEmail) {
   try {
-    // find user
     let userDoc = null;
     const byUid = await db.collection("users").doc(usernameOrEmail).get();
     if (byUid.exists) userDoc = byUid;
     if (!userDoc) {
-      const q = await db
-        .collection("users")
-        .where("email", "==", usernameOrEmail)
-        .limit(1)
-        .get();
+      const q = await db.collection("users").where("email", "==", usernameOrEmail).limit(1).get();
       if (!q.empty) userDoc = q.docs[0];
     }
     if (userDoc) {
@@ -910,7 +892,6 @@ async function disableVPNAccess(usernameOrEmail) {
       });
     }
 
-    // session
     const sessionRef = db.collection("vpn_sessions").doc(usernameOrEmail);
     const s = await sessionRef.get();
     if (s.exists) {
@@ -954,31 +935,14 @@ app.post("/vpn/session/connect", async (req, res) => {
     try {
       const user = snap.docs[0].data();
       if (user && user.vpnDeviceId) {
+        // still try enabling the existing device (best-effort)
         await tailscaleEnableDevice(user.vpnDeviceId);
       } else {
-        // attempt to auto-assign a node if none assigned (best-effort)
-        const uidOrEmail = email;
-        const existingSession = await db.collection("vpn_sessions").doc(uidOrEmail).get();
-        if (!existingSession.exists) {
-          const pick = await pickBestNode();
-          if (pick) {
-            await assignNodeToUser(pick.ref, uidOrEmail);
-            await db.collection("vpn_sessions").doc(uidOrEmail).set({
-              nodeId: pick.ref.id,
-              assignedAt: new Date().toISOString(),
-              active: true,
-              user: user.email || uidOrEmail,
-            });
-            await docRef.update({ vpnAssignedAt: new Date().toISOString(), vpnDeviceId: pick.ref.id });
-            console.log(`Auto-assigned node ${pick.ref.id} to ${uidOrEmail} on connect`);
-          }
-        } else {
-          // Make sure user vpnActive true (idempotent)
-          await docRef.update({ vpnActive: true });
-        }
+        // Auto-assign on connect has been DISABLED to avoid errors.
+        console.log(`Auto-assign on connect disabled for ${email}.`);
       }
     } catch (err) {
-      console.warn("connect: tailscale enable/assign attempt failed:", err.message || err);
+      console.warn("connect: tailscale enable attempt failed:", err.message || err);
     }
 
     res.json({ success: true });
@@ -998,14 +962,10 @@ app.post("/vpn/session/disconnect", async (req, res) => {
     if (snap.empty) return res.status(404).json({ error: "User not found" });
 
     const userRef = snap.docs[0].ref;
-    const u = snap.docs[0].data();
-
-    // Consume from buckets
     const consumeRes = await consumeFromPlanBuckets(userRef, Number(data_used_mb || 0));
     const over = consumeRes.exhausted;
-    const expired = consumeRes.totalRemaining <= 0; // no remaining buckets
+    const expired = consumeRes.totalRemaining <= 0;
 
-    // Update lastDisconnect etc (consumeFromPlanBuckets already updated plan fields)
     await userRef.update({
       lastDisconnect: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
@@ -1042,8 +1002,6 @@ app.post("/vpn/session/update-usage", async (req, res) => {
 
     const consumeRes = await consumeFromPlanBuckets(userRef, Number(usage_mb || 0));
     const totalRemaining = consumeRes.totalRemaining || 0;
-
-    // percent computed vs previous total (best-effort)
     const percent = prevTotal > 0 ? ((prevTotal - totalRemaining) / (prevTotal || 1)) * 100 : 0;
 
     if (percent >= 90 && percent < 100) {
@@ -1086,33 +1044,28 @@ app.get("/cron/expire-check", async (req, res) => {
     console.log("⏰ Checking expired users (bucket-based)...");
     const usersSnapshot = await db.collection("users").get();
     let disabled = 0;
-    let renewed = 0;
 
     for (const doc of usersSnapshot.docs) {
       const u = doc.data();
-      // Purge expired buckets and recompute totals
       const purgeRes = await purgeExpiredBucketsForUser(doc.ref);
       const totalRemaining = purgeRes.totalRemaining || 0;
 
       if (totalRemaining <= 0) {
-        // disable access
         await disableVPNAccess(u.email || u.username || doc.id);
         await doc.ref.update({ vpnActive: false, updatedAt: new Date().toISOString() });
         disabled++;
         console.log(`🚫 Disabled user due to no remaining buckets: ${u.email || doc.id}`);
-      } else {
-        // user still has buckets
       }
     }
 
-    res.json({ message: `✅ Expire check done: ${disabled} disabled, ${renewed} renewed.` });
+    res.json({ message: `✅ Expire check done: ${disabled} disabled.` });
   } catch (err) {
     console.error("❌ Expire check error:", err);
     res.status(500).json({ error: err.message || String(err) });
   }
 });
 
-// Periodic tailscale-sync (keeps tailscale_nodes updated). you can call this endpoint via scheduler
+// Tailscale sync (admin)
 app.get("/cron/tailscale-sync", requireAdmin, async (_, res) => {
   try {
     const devices = await tailscaleListDevices();
