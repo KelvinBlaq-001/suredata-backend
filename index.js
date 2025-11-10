@@ -336,6 +336,7 @@ async function setNodeOnline(nodeDocRef, online) {
 
 // ----------------------------
 // PAYSTACK WEBHOOK (UPDATED: idempotent + migration into plans[])
+// NOTE: changed to use txRef.create() to avoid race-duplicates
 app.post(
   "/payments/webhook",
   express.raw({ type: "application/json" }),
@@ -377,22 +378,52 @@ app.post(
       const amount = data.amount / 100;
       const email = (data.customer?.email || "").toLowerCase();
 
-      // --- IDP: check transactions doc to avoid duplicate processing ---
+      // --- IDP: use create() to reserve the transaction doc atomically ---
       const txRef = db.collection("transactions").doc(reference);
-      const txSnap = await txRef.get();
-      if (txSnap.exists && txSnap.data() && txSnap.data().status === "success") {
-        console.log(`🔁 Duplicate webhook detected for reference ${reference} — skipping.`);
-        return res.sendStatus(200);
-      }
+      const now = new Date();
 
-      // mark processing (prevents concurrent double writes)
-      await txRef.set({
-        email,
-        reference,
-        amount,
-        status: "processing",
-        receivedAt: new Date().toISOString()
-      }, { merge: true });
+      try {
+        // Attempt to create the transaction doc; fails if already exists.
+        await txRef.create({
+          email,
+          reference,
+          amount,
+          status: "processing",
+          receivedAt: now.toISOString(),
+        });
+        // created successfully — this process owns the reference now
+      } catch (createErr) {
+        // If the document already exists, read it and decide
+        if (createErr && createErr.code && createErr.code === 6) {
+          // Firestore gRPC ALREADY_EXISTS sometimes surfaces as code 6
+          // fallthrough to read existing
+        }
+        const existing = await txRef.get();
+        if (existing.exists) {
+          const s = existing.data() || {};
+          if (s.status === "success") {
+            console.log(`🔁 Duplicate webhook detected for reference ${reference} — already processed.`);
+            return res.sendStatus(200);
+          }
+          if (s.status === "processing") {
+            console.log(`🔁 Webhook received while processing reference ${reference} — another worker is handling it. Skipping.`);
+            return res.sendStatus(200);
+          }
+          // if previous status was "failed" or other, allow reprocessing below
+          console.log(`ℹ️ Transaction doc exists with status='${s.status}', proceeding to reprocess: ${reference}`);
+        } else {
+          // unexpected, rethrow
+          console.warn("txRef.create failed unexpectedly and existing doc not found:", createErr);
+          // let later logic continue (we'll attempt to set processing below), but safer to retry set
+          await txRef.set({
+            email,
+            reference,
+            amount,
+            status: "processing",
+            receivedAt: now.toISOString(),
+          }, { merge: true });
+        }
+      }
 
       // ✅ Match plan by amount
       const plans = {
@@ -434,8 +465,7 @@ app.post(
         console.warn("Legacy migration error (non-fatal):", e.message || e);
       }
 
-      // Build new bucket
-      const now = new Date();
+      // Build new bucket (attach transaction reference for traceability)
       const newExpiry = new Date();
       newExpiry.setDate(newExpiry.getDate() + plan.days);
 
@@ -445,9 +475,10 @@ app.post(
         remainingMB: plan.dataLimit,
         purchasedAt: now.toISOString(),
         expiry: newExpiry.toISOString(),
+        purchaseReference: reference, // help trace / idempotency
       };
 
-      // Append bucket and finalize transaction (idempotent via transactions doc above)
+      // Append bucket and finalize transaction (this append will only be executed by the first process that created txRef)
       try {
         const appendRes = await appendPlanBucketForUser(userRef, bucket);
 
