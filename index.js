@@ -1,5 +1,5 @@
-// index.js — SureData Backend (Production-ready, Plan buckets migration + idempotent webhook)
-// NOTE: This file is your original with only the migration + idempotent webhook additions you requested.
+// index.js — SureData Backend (Production-ready, Plan buckets migration + idempotent webhook + prune expired buckets)
+// NOTE: This file is your original with only the migration + idempotent webhook additions and prune/auto-disable logic you requested.
 
 import express from "express";
 import cors from "cors";
@@ -136,6 +136,107 @@ function computeTotalRemainingFromPlans(plans = []) {
   }, 0);
 }
 
+function isBucketExpired(bucket, now = new Date()) {
+  if (!bucket) return false;
+  if (!bucket.expiry) return false;
+  try {
+    const exp = new Date(bucket.expiry);
+    return exp < now;
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * Prune expired or empty plan buckets from a user document (transactional).
+ * - Removes buckets where expiry < now OR remainingMB <= 0
+ * - Recomputes totalDataDisplay, planLimit, expiryDate
+ * - If result has zero active buckets, sets vpnActive = false
+ *
+ * Returns { pruned: boolean, remainingCount, totalRemaining }
+ */
+async function pruneExpiredAndEmptyBuckets(userRef) {
+  const now = new Date();
+  const result = await db.runTransaction(async (t) => {
+    const snap = await t.get(userRef);
+    if (!snap.exists) {
+      return { pruned: false, remainingCount: 0, totalRemaining: 0 };
+    }
+    const u = snap.data() || {};
+    const plans = Array.isArray(u.plans) ? [...u.plans] : [];
+
+    const keep = plans.filter((p) => {
+      if (!p) return false;
+      const remaining = Number(p.remainingMB != null ? p.remainingMB : p.dataLimitMB || p.dataLimit || 0);
+      if (isNaN(remaining)) return false;
+      if (remaining <= 0) return false;
+      if (p.expiry) {
+        try {
+          const exp = new Date(p.expiry);
+          if (exp < now) return false; // expired — drop it
+        } catch (e) {
+          // if expiry invalid, be conservative and keep
+        }
+      }
+      return true;
+    });
+
+    const totalRemaining = computeTotalRemainingFromPlans(keep);
+    const earliestExpiry = keep.length
+      ? keep
+          .map((p) => (p.expiry ? new Date(p.expiry) : null))
+          .filter(Boolean)
+          .sort((a, b) => a - b)[0]
+      : null;
+
+    const updates = {
+      plans: keep,
+      totalDataDisplay: totalRemaining,
+      planLimit: totalRemaining,
+      expiryDate: earliestExpiry ? earliestExpiry.toISOString() : admin.firestore.FieldValue.delete(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    // if no active buckets left, ensure vpnActive is false
+    if (!keep.length) updates.vpnActive = false;
+
+    t.update(userRef, updates);
+
+    return { pruned: true, remainingCount: keep.length, totalRemaining };
+  });
+
+  // after transaction, if there are no remaining buckets, disable VPN access (best-effort) and notify
+  try {
+    if (result.remainingCount === 0) {
+      // read user doc to get email / username for disabling (non-transactional)
+      const userSnap = await userRef.get();
+      const u = userSnap.exists ? userSnap.data() : {};
+      const usernameOrEmail = u.email || u.uid || userRef.id;
+      try {
+        if (typeof disableVPNAccess === "function") {
+          await disableVPNAccess(usernameOrEmail);
+        } else {
+          console.log("disableVPNAccess not defined; skipping external VPN disable.");
+        }
+      } catch (e) {
+        console.warn("prune: disableVPNAccess error:", e.message || e);
+      }
+      // notify user
+      if (u && u.email) {
+        await sendUserNotification(
+          u.email,
+          "plan_exhausted",
+          "🚫 Your plan has expired or been exhausted. Please purchase a new plan to re-enable VPN access."
+        );
+      }
+    }
+  } catch (notifyErr) {
+    console.warn("prune: post-transaction notify/disable error:", notifyErr.message || notifyErr);
+  }
+
+  return result;
+}
+
 /**
  * Append a plan bucket to a user doc and recompute summary fields (transactional + dedupe).
  * - userRef: DocumentReference
@@ -148,7 +249,26 @@ async function appendPlanBucketForUser(userRef, bucket) {
   return db.runTransaction(async (t) => {
     const snap = await t.get(userRef);
     const u = snap.exists ? snap.data() : {};
-    const currentPlans = Array.isArray(u.plans) ? [...u.plans] : [];
+    const currentPlansRaw = Array.isArray(u.plans) ? [...u.plans] : [];
+
+    const now = new Date();
+
+    // Filter out expired/empty plans for merging (we don't want expired buckets to roll into new purchase)
+    const currentPlans = currentPlansRaw.filter((p) => {
+      if (!p) return false;
+      const remaining = Number(p.remainingMB != null ? p.remainingMB : p.dataLimitMB || p.dataLimit || 0);
+      if (isNaN(remaining)) return false;
+      if (remaining <= 0) return false;
+      if (p.expiry) {
+        try {
+          const exp = new Date(p.expiry);
+          if (exp < now) return false;
+        } catch (e) {
+          // if expiry invalid, keep
+        }
+      }
+      return true;
+    });
 
     // 1) If bucket has purchaseReference, skip if any existing plan already has same reference
     if (bucket.purchaseReference) {
@@ -183,7 +303,7 @@ async function appendPlanBucketForUser(userRef, bucket) {
       return { skipped: true, totalRemaining, plans: currentPlans };
     }
 
-    // 3) Append bucket and recompute totals
+    // 3) Append bucket and recompute totals (we'll keep only non-expired plans + new bucket)
     const mergedPlans = [...currentPlans, bucket];
     const totalRemaining = computeTotalRemainingFromPlans(mergedPlans);
     const earliestExpiry = mergedPlans.length
@@ -200,6 +320,7 @@ async function appendPlanBucketForUser(userRef, bucket) {
       planLimit: totalRemaining,
       expiryDate: earliestExpiry ? earliestExpiry.toISOString() : admin.firestore.FieldValue.delete(),
       updatedAt: new Date().toISOString(),
+      vpnActive: true, // re-enable VPN on successful purchase
     };
 
     t.update(userRef, updates);
@@ -380,7 +501,7 @@ async function setNodeOnline(nodeDocRef, online) {
 }
 
 // ----------------------------
-// PAYSTACK WEBHOOK (UPDATED: idempotent + migration into plans[])
+// PAYSTACK WEBHOOK (UPDATED: idempotent + migration into plans[] + prune expired buckets)
 // NOTE: changed to use txRef.create() to avoid race-duplicates
 app.post(
   "/payments/webhook",
@@ -501,13 +622,23 @@ app.post(
       }
 
       const userRef = snap.docs[0].ref;
-      const userData = snap.docs[0].data();
+      let userData = snap.docs[0].data();
 
       // --- MIGRATE LEGACY FIELDS INTO plans[] IF NEEDED (idempotent) ---
       try {
         await migrateLegacyToPlansIfNeeded(userRef, userData);
+        // re-read user data after possible migration
+        const afterMig = await userRef.get();
+        userData = afterMig.exists ? afterMig.data() : userData;
       } catch (e) {
         console.warn("Legacy migration error (non-fatal):", e.message || e);
+      }
+
+      // --- PRUNE expired/empty buckets BEFORE appending new purchase
+      try {
+        await pruneExpiredAndEmptyBuckets(userRef);
+      } catch (e) {
+        console.warn("prune before append failed (non-fatal):", e.message || e);
       }
 
       // Build new bucket (attach transaction reference for traceability)
@@ -845,12 +976,24 @@ app.post("/vpn/session/disconnect", async (req, res) => {
     if (snap.empty) return res.status(404).json({ error: "User not found" });
 
     const doc = snap.docs[0];
-    const u = doc.data();
+    const uRef = doc.ref;
+
+    // prune expired/empty buckets first to ensure planLimit reflects only active buckets
+    try {
+      await pruneExpiredAndEmptyBuckets(uRef);
+    } catch (e) {
+      console.warn("disconnect: prune failed (non-fatal):", e.message || e);
+    }
+
+    // re-fetch user after prune
+    const after = await uRef.get();
+    const u = after.exists ? after.data() : {};
+
     const used = (u.dataUsed || 0) + data_used_mb;
     const over = used >= (u.planLimit || Infinity);
     const expired = u.expiryDate && new Date(u.expiryDate) < new Date();
 
-    await doc.ref.update({
+    await uRef.update({
       dataUsed: used,
       vpnActive: !over && !expired,
       lastDisconnect: new Date().toISOString(),
@@ -859,13 +1002,21 @@ app.post("/vpn/session/disconnect", async (req, res) => {
 
     if (over || expired) {
       // disable both local VPN and tailscale device
-      await disableVPNAccess(username);
+      try {
+        if (typeof disableVPNAccess === "function") {
+          await disableVPNAccess(username);
+        } else {
+          console.log("disableVPNAccess not defined; skipping external VPN disable.");
+        }
+      } catch (e) {
+        console.warn("disconnect: disableVPNAccess error:", e.message || e);
+      }
       await sendUserNotification(
         username,
         "plan_exhausted",
         expired
           ? "Your plan has expired. Please renew."
-          : "Your data limit has been exhausted."
+          : "Your data limit has been exhausted. Please purchase a new plan to continue using VPN."
       );
     }
 
@@ -883,7 +1034,19 @@ app.post("/vpn/session/update-usage", async (req, res) => {
     if (snap.empty) return res.status(404).json({ error: "User not found" });
 
     const doc = snap.docs[0];
-    const u = doc.data();
+    const uRef = doc.ref;
+
+    // prune expired/empty buckets first to ensure planLimit reflects only active buckets
+    try {
+      await pruneExpiredAndEmptyBuckets(uRef);
+    } catch (e) {
+      console.warn("update-usage: prune failed (non-fatal):", e.message || e);
+    }
+
+    // re-fetch user after prune
+    const after = await uRef.get();
+    const u = after.exists ? after.data() : {};
+
     const used = (u.dataUsed || 0) + usage_mb;
     const percent = (used / (u.planLimit || 1)) * 100;
 
@@ -898,20 +1061,28 @@ app.post("/vpn/session/update-usage", async (req, res) => {
     const over = used >= (u.planLimit || Infinity);
     const expired = u.expiryDate && new Date(u.expiryDate) < new Date();
 
-    await doc.ref.update({
+    await uRef.update({
       dataUsed: used,
       vpnActive: !over && !expired,
       updatedAt: new Date().toISOString(),
     });
 
     if (over || expired) {
-      await disableVPNAccess(username);
+      try {
+        if (typeof disableVPNAccess === "function") {
+          await disableVPNAccess(username);
+        } else {
+          console.log("disableVPNAccess not defined; skipping external VPN disable.");
+        }
+      } catch (e) {
+        console.warn("update-usage: disableVPNAccess error:", e.message || e);
+      }
       await sendUserNotification(
         username,
         "plan_exhausted",
         over
-          ? "🚫 Your data plan has been exhausted."
-          : "⌛ Your plan has expired."
+          ? "🚫 Your data plan has been exhausted. Please purchase a new plan to continue using VPN."
+          : "⌛ Your plan has expired. Please renew to re-enable VPN."
       );
     }
 
@@ -931,15 +1102,17 @@ app.all("/cron/expire-check", async (_, res) => {
     let disabled = 0;
 
     for (const doc of snap.docs) {
-      const u = doc.data();
-      const expired = u.expiryDate && new Date(u.expiryDate) < now;
-      const exhausted =
-        (u.planLimit || 0) > 0 && (u.dataUsed || 0) >= u.planLimit;
+      const userRef = doc.ref;
 
-      if (expired || exhausted) {
-        await doc.ref.update({ vpnActive: false, updatedAt: new Date().toISOString() });
-        await disableVPNAccess(u.email || u.username || doc.id);
-        disabled++;
+      // Prune expired/empty buckets for each user
+      try {
+        const pr = await pruneExpiredAndEmptyBuckets(userRef);
+        // if pruning left zero active plans, increment disabled and ensure VPN disabled
+        if (pr.remainingCount === 0) {
+          disabled++;
+        }
+      } catch (e) {
+        console.warn(`cron prune error for ${doc.id}:`, e.message || e);
       }
     }
 
