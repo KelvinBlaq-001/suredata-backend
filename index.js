@@ -126,6 +126,7 @@ async function tailscaleDisableDevice(deviceId) {
 // ----------------------
 // === ADDED HELPERS: plan-bucket utilities & migration helpers ===
 // (these are the only additions beyond your original file)
+
 // Compute total remaining MB from plans array
 function computeTotalRemainingFromPlans(plans = []) {
   if (!Array.isArray(plans)) return 0;
@@ -135,34 +136,75 @@ function computeTotalRemainingFromPlans(plans = []) {
   }, 0);
 }
 
-// Append a plan bucket to a user doc and recompute summary fields
+/**
+ * Append a plan bucket to a user doc and recompute summary fields (transactional + dedupe).
+ * - userRef: DocumentReference
+ * - bucket: { name, dataLimitMB, remainingMB, purchasedAt, expiry, purchaseReference? }
+ *
+ * Returns { skipped: boolean, totalRemaining, plans }
+ */
 async function appendPlanBucketForUser(userRef, bucket) {
-  // Use arrayUnion to append (keeps multi-writer safe). We'll rely on transactions doc for idempotency.
-  await userRef.update({
-    plans: admin.firestore.FieldValue.arrayUnion(bucket),
-    updatedAt: new Date().toISOString(),
+  // run a transaction: read current plans, check duplicates, write merged plans + totals atomically
+  return db.runTransaction(async (t) => {
+    const snap = await t.get(userRef);
+    const u = snap.exists ? snap.data() : {};
+    const currentPlans = Array.isArray(u.plans) ? [...u.plans] : [];
+
+    // 1) If bucket has purchaseReference, skip if any existing plan already has same reference
+    if (bucket.purchaseReference) {
+      const found = currentPlans.some((p) => p && p.purchaseReference === bucket.purchaseReference);
+      if (found) {
+        const totalRemaining = computeTotalRemainingFromPlans(currentPlans);
+        return { skipped: true, totalRemaining, plans: currentPlans };
+      }
+    }
+
+    // 2) Additional conservative near-duplicate detection:
+    // if an existing plan has same name + dataLimitMB + expiry + purchasedAt within 5 minutes, treat as duplicate
+    const purchasedAtDate = bucket.purchasedAt ? new Date(bucket.purchasedAt).getTime() : null;
+    const nearDup = currentPlans.some((p) => {
+      try {
+        if (!p) return false;
+        const sameName = String(p.name || "") === String(bucket.name || "");
+        const sameSize = Number(p.dataLimitMB || p.dataLimit || 0) === Number(bucket.dataLimitMB || 0);
+        const sameExpiry = (p.expiry || "") === (bucket.expiry || "");
+        let timeClose = false;
+        if (p.purchasedAt && purchasedAtDate) {
+          const diff = Math.abs(new Date(p.purchasedAt).getTime() - purchasedAtDate);
+          timeClose = diff <= 5 * 60 * 1000; // within 5 minutes
+        }
+        return sameName && sameSize && sameExpiry && timeClose;
+      } catch (e) {
+        return false;
+      }
+    });
+    if (nearDup) {
+      const totalRemaining = computeTotalRemainingFromPlans(currentPlans);
+      return { skipped: true, totalRemaining, plans: currentPlans };
+    }
+
+    // 3) Append bucket and recompute totals
+    const mergedPlans = [...currentPlans, bucket];
+    const totalRemaining = computeTotalRemainingFromPlans(mergedPlans);
+    const earliestExpiry = mergedPlans.length
+      ? mergedPlans
+          .map((p) => (p.expiry ? new Date(p.expiry) : null))
+          .filter(Boolean)
+          .sort((a, b) => a - b)[0]
+      : null;
+
+    // write merged plans + summary fields
+    const updates = {
+      plans: mergedPlans,
+      totalDataDisplay: totalRemaining,
+      planLimit: totalRemaining,
+      expiryDate: earliestExpiry ? earliestExpiry.toISOString() : admin.firestore.FieldValue.delete(),
+      updatedAt: new Date().toISOString(),
+    };
+
+    t.update(userRef, updates);
+    return { skipped: false, totalRemaining, plans: mergedPlans };
   });
-
-  // Recompute summary fields after append
-  const snap = await userRef.get();
-  const u = snap.exists ? snap.data() : {};
-  const plans = Array.isArray(u.plans) ? u.plans : [];
-  const totalRemaining = computeTotalRemainingFromPlans(plans);
-  const earliestExpiry = plans.length
-    ? plans
-        .map((p) => (p.expiry ? new Date(p.expiry) : null))
-        .filter(Boolean)
-        .sort((a, b) => a - b)[0]
-    : null;
-
-  await userRef.update({
-    totalDataDisplay: totalRemaining,
-    planLimit: totalRemaining,
-    expiryDate: earliestExpiry ? earliestExpiry.toISOString() : admin.firestore.FieldValue.delete(),
-    updatedAt: new Date().toISOString(),
-  });
-
-  return { totalRemaining, plans };
 }
 
 // Migrate legacy fields into plans[] (idempotent)
@@ -186,6 +228,8 @@ async function migrateLegacyToPlansIfNeeded(userRef, userData) {
           remainingMB: Number(rem),
           purchasedAt: userData.lastPayment?.date || new Date().toISOString(),
           expiry: userData.expiryDate || null,
+          // attach lastPayment.reference if present — helps avoid duplicate later
+          purchaseReference: userData.lastPayment?.reference || undefined,
         });
       }
     }
@@ -206,6 +250,7 @@ async function migrateLegacyToPlansIfNeeded(userRef, userData) {
           remainingMB: Number(p.dataLimit || 0),
           purchasedAt: p.purchasedAt || new Date().toISOString(),
           expiry,
+          purchaseReference: p.reference || p.purchaseReference || undefined,
         });
       }
     }
@@ -478,9 +523,23 @@ app.post(
         purchaseReference: reference, // help trace / idempotency
       };
 
-      // Append bucket and finalize transaction (this append will only be executed by the first process that created txRef)
+      // Append bucket and finalize transaction (transactional append prevents duplicates)
       try {
         const appendRes = await appendPlanBucketForUser(userRef, bucket);
+
+        if (appendRes.skipped) {
+          // mark tx as already-appended (safe)
+          await txRef.set({
+            status: "success",
+            processedAt: new Date().toISOString(),
+            plan: plan.name,
+            totalAfter: appendRes.totalRemaining,
+            note: "append_skipped_duplicate"
+          }, { merge: true });
+
+          console.log(`ℹ️ Append skipped (duplicate) for ${email} reference=${reference}`);
+          return res.sendStatus(200);
+        }
 
         // update transaction as success
         await txRef.set({
