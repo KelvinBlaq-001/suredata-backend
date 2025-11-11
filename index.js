@@ -1,6 +1,4 @@
-// index.js — SureData Backend (Production-ready, Plan buckets migration + idempotent webhook + prune/consume + progress fields)
-// Full file: includes totalAllocatedMB, totalRemainingMB, totalUsedMB, progressPercent for UI sync.
-
+// index.js — SureData Backend (Production-ready, Plan buckets migration + idempotent webhook + prune expired buckets + threshold notifications)
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
@@ -64,6 +62,44 @@ async function sendUserNotification(email, type, message) {
   }
 }
 
+/**
+ * New helper: send threshold notifications (70%, 98%, etc.)
+ * - Keeps track of thresholds already sent in users.notificationsSentThresholds (array of numbers)
+ */
+async function sendThresholdNotifications(userRef, email, percent) {
+  if (!email) return;
+  try {
+    const snap = await userRef.get();
+    if (!snap.exists) return;
+    const u = snap.data() || {};
+    const sent = Array.isArray(u.notificationsSentThresholds) ? u.notificationsSentThresholds : [];
+    // thresholds we want to notify for (add/remove as needed)
+    const thresholds = [70, 98];
+
+    // determine which thresholds are now crossed but not yet sent
+    const toSend = thresholds.filter((t) => percent >= t && !sent.includes(t));
+
+    for (const t of toSend) {
+      let message = `⚠️ You've used ${t}% of your plan.`;
+      if (t === 98) {
+        message = `⚠️ You're at ${t}% — your data is almost exhausted. Please prepare to renew.`;
+      } else if (t === 70) {
+        message = `⚠️ You've used ${t}% of your plan. Consider monitoring your usage.`;
+      }
+      await sendUserNotification(email, "plan_near_limit", message);
+    }
+
+    if (toSend.length) {
+      // persist which thresholds we've sent so we don't spam the user
+      await userRef.update({
+        notificationsSentThresholds: admin.firestore.FieldValue.arrayUnion(...toSend),
+      });
+    }
+  } catch (e) {
+    console.warn("sendThresholdNotifications error:", e.message || e);
+  }
+}
+
 // ----------------------
 // TAILSCALE HELPERS (updated with TAILSCALE_API_BASE)
 // ----------------------
@@ -124,36 +160,15 @@ async function tailscaleDisableDevice(deviceId) {
 }
 
 // ----------------------
-// === ADDED HELPERS: plan-bucket utilities, status + consumption + migration helpers + progress fields ===
-// ----------------------
+// === ADDED HELPERS: plan-bucket utilities & migration helpers ===
+// (these are the only additions beyond your original file)
 
-/**
- * computeTotalRemainingFromPlans(plans, options)
- * - options.onlyActive (default true) - sums remainingMB/limit only for buckets considered active
- */
-function computeTotalRemainingFromPlans(plans = [], options = { onlyActive: true }) {
+// Compute total remaining MB from plans array
+function computeTotalRemainingFromPlans(plans = []) {
   if (!Array.isArray(plans)) return 0;
-  const onlyActive = options.onlyActive !== undefined ? options.onlyActive : true;
   return plans.reduce((sum, p) => {
-    if (!p) return sum;
-    if (onlyActive && String((p.status || "active")).toLowerCase() !== "active") return sum;
     const rem = p.remainingMB != null ? Number(p.remainingMB) : Number(p.dataLimitMB || p.dataLimit || 0);
     return sum + (isNaN(rem) ? 0 : rem);
-  }, 0);
-}
-
-/**
- * computeTotalAllocatedFromPlans(plans, options)
- * - sums original dataLimitMB for buckets (only active if onlyActive true)
- */
-function computeTotalAllocatedFromPlans(plans = [], options = { onlyActive: true }) {
-  if (!Array.isArray(plans)) return 0;
-  const onlyActive = options.onlyActive !== undefined ? options.onlyActive : true;
-  return plans.reduce((sum, p) => {
-    if (!p) return sum;
-    if (onlyActive && String((p.status || "active")).toLowerCase() !== "active") return sum;
-    const alloc = Number(p.dataLimitMB || p.dataLimit || 0);
-    return sum + (isNaN(alloc) ? 0 : alloc);
   }, 0);
 }
 
@@ -169,270 +184,141 @@ function isBucketExpired(bucket, now = new Date()) {
 }
 
 /**
- * computeProgressFields(plans)
- * - returns { totalAllocatedMB, totalRemainingMB, totalUsedMB, progressPercent }
- * - only counts 'active' buckets
+ * Prune expired or empty plan buckets from a user document (transactional).
+ * - Removes buckets where expiry < now OR remainingMB <= 0
+ * - Recomputes totalDataDisplay, planLimit, expiryDate
+ * - If result has zero active buckets, sets vpnActive = false
+ *
+ * Returns { pruned: boolean, remainingCount, totalRemaining }
  */
-function computeProgressFields(plans = []) {
-  const totalRemainingMB = computeTotalRemainingFromPlans(plans, { onlyActive: true });
-  const totalAllocatedMB = computeTotalAllocatedFromPlans(plans, { onlyActive: true });
-  const totalUsedMB = Math.max(0, totalAllocatedMB - totalRemainingMB);
-  const progressPercent = totalAllocatedMB > 0 ? Math.min(100, (totalUsedMB / totalAllocatedMB) * 100) : 0;
-  // round to 1 decimal to keep UI tidy
-  const progressRounded = Math.round(progressPercent * 10) / 10;
-  return {
-    totalAllocatedMB,
-    totalRemainingMB,
-    totalUsedMB,
-    progressPercent: progressRounded,
-  };
-}
-
-/**
- * normalizeBucketStatuses(userRef)
- * - Transactionally walks plans[] and sets status on each bucket:
- *    - 'expired' if expiry < now
- *    - 'exhausted' if remainingMB <= 0
- *    - otherwise 'active'
- * - Recomputes totals based on active buckets only and updates planLimit/totalDataDisplay/expiryDate
- * - ALSO writes totalAllocatedMB, totalRemainingMB, totalUsedMB, progressPercent (for UI)
- */
-async function normalizeBucketStatuses(userRef) {
+async function pruneExpiredAndEmptyBuckets(userRef) {
   const now = new Date();
-  return db.runTransaction(async (t) => {
+  const result = await db.runTransaction(async (t) => {
     const snap = await t.get(userRef);
-    if (!snap.exists) return { updated: false, remainingCount: 0, totalRemaining: 0 };
+    if (!snap.exists) {
+      return { pruned: false, remainingCount: 0, totalRemaining: 0 };
+    }
     const u = snap.data() || {};
-    const plansRaw = Array.isArray(u.plans) ? [...u.plans] : [];
+    const plans = Array.isArray(u.plans) ? [...u.plans] : [];
 
-    const normalized = plansRaw.map((p) => {
-      if (!p) return p;
-      const copy = { ...p };
-      const remaining = Number(copy.remainingMB != null ? copy.remainingMB : copy.dataLimitMB || copy.dataLimit || 0);
-      let expired = false;
-      if (copy.expiry) {
+    const keep = plans.filter((p) => {
+      if (!p) return false;
+      const remaining = Number(p.remainingMB != null ? p.remainingMB : p.dataLimitMB || p.dataLimit || 0);
+      if (isNaN(remaining)) return false;
+      if (remaining <= 0) return false;
+      if (p.expiry) {
         try {
-          const exp = new Date(copy.expiry);
-          if (exp < now) expired = true;
+          const exp = new Date(p.expiry);
+          if (exp < now) return false; // expired — drop it
         } catch (e) {
-          // ignore
+          // if expiry invalid, be conservative and keep
         }
       }
-      if (expired) {
-        copy.status = "expired";
-      } else if (isNaN(remaining) || remaining <= 0) {
-        copy.status = "exhausted";
-        copy.remainingMB = Math.max(isNaN(remaining) ? 0 : remaining, 0);
-      } else {
-        copy.status = copy.status ? copy.status : "active";
-      }
-      return copy;
+      return true;
     });
 
-    const { totalAllocatedMB, totalRemainingMB, totalUsedMB, progressPercent } = computeProgressFields(normalized);
-    const activePlans = normalized.filter((p) => p && String(p.status).toLowerCase() === "active");
-
-    const earliestExpiry = activePlans.length
-      ? activePlans
+    const totalRemaining = computeTotalRemainingFromPlans(keep);
+    const earliestExpiry = keep.length
+      ? keep
           .map((p) => (p.expiry ? new Date(p.expiry) : null))
           .filter(Boolean)
           .sort((a, b) => a - b)[0]
       : null;
 
     const updates = {
-      plans: normalized,
-      // keep old fields for compatibility
-      totalDataDisplay: totalRemainingMB,
-      planLimit: totalRemainingMB,
-      // new explicit fields for UI clarity
-      totalAllocatedMB,
-      totalRemainingMB,
-      totalUsedMB,
-      progressPercent,
+      plans: keep,
+      totalDataDisplay: totalRemaining,
+      planLimit: totalRemaining,
       expiryDate: earliestExpiry ? earliestExpiry.toISOString() : admin.firestore.FieldValue.delete(),
       updatedAt: new Date().toISOString(),
     };
 
-    if (!activePlans.length) updates.vpnActive = false;
+    // if no active buckets left, ensure vpnActive is false
+    if (!keep.length) updates.vpnActive = false;
 
     t.update(userRef, updates);
 
-    return { updated: true, remainingCount: activePlans.length, totalRemaining: totalRemainingMB };
+    return { pruned: true, remainingCount: keep.length, totalRemaining };
   });
-}
 
-/**
- * consumeUsageFromBuckets(userRef, usageMb)
- * - Deducts usageMb from active plan buckets FIFO by earliest expiry (transactional)
- * - Updates bucket.remainingMB, sets bucket.status='exhausted' when depleted
- * - Increments user.dataUsed by consumed amount
- * - Recomputes totals based on active buckets
- * - Writes progress fields for UI
- * Returns { consumed: number, stillNeeded: number, totalRemaining, remainingActiveBuckets, totalAllocatedMB, totalUsedMB, progressPercent }
- */
-async function consumeUsageFromBuckets(userRef, usageMb) {
-  if (!usageMb || usageMb <= 0) return { consumed: 0, stillNeeded: 0, totalRemaining: 0, remainingActiveBuckets: 0, totalAllocatedMB: 0, totalUsedMB: 0, progressPercent: 0 };
-
-  return db.runTransaction(async (t) => {
-    const snap = await t.get(userRef);
-    if (!snap.exists) return { consumed: 0, stillNeeded: usageMb, totalRemaining: 0, remainingActiveBuckets: 0, totalAllocatedMB: 0, totalUsedMB: 0, progressPercent: 0 };
-    const u = snap.data() || {};
-    const plansRaw = Array.isArray(u.plans) ? [...u.plans] : [];
-
-    const now = new Date();
-    // Normalize existing plans locally
-    const normalized = plansRaw.map((p) => {
-      if (!p) return p;
-      const copy = { ...p };
-      const remaining = Number(copy.remainingMB != null ? copy.remainingMB : copy.dataLimitMB || copy.dataLimit || 0);
-      let expired = false;
-      if (copy.expiry) {
-        try {
-          const exp = new Date(copy.expiry);
-          if (exp < now) expired = true;
-        } catch (e) {}
+  // after transaction, if there are no remaining buckets, disable VPN access (best-effort) and notify
+  try {
+    if (result.remainingCount === 0) {
+      // read user doc to get email / username for disabling (non-transactional)
+      const userSnap = await userRef.get();
+      const u = userSnap.exists ? userSnap.data() : {};
+      const usernameOrEmail = u.email || u.uid || userRef.id;
+      try {
+        if (typeof disableVPNAccess === "function") {
+          await disableVPNAccess(usernameOrEmail);
+        } else {
+          console.log("disableVPNAccess not defined; skipping external VPN disable.");
+        }
+      } catch (e) {
+        console.warn("prune: disableVPNAccess error:", e.message || e);
       }
-      if (expired) {
-        copy.status = "expired";
-      } else if (isNaN(remaining) || remaining <= 0) {
-        copy.status = "exhausted";
-        copy.remainingMB = Math.max(isNaN(remaining) ? 0 : remaining, 0);
-      } else {
-        copy.status = copy.status ? copy.status : "active";
-      }
-      return copy;
-    });
-
-    // Sort active plans FIFO by expiry then purchasedAt
-    const activePlans = normalized
-      .map((p, idx) => ({ p, idx }))
-      .filter((x) => x.p && String(x.p.status).toLowerCase() === "active")
-      .sort((a, b) => {
-        const aExp = a.p.expiry ? new Date(a.p.expiry).getTime() : Infinity;
-        const bExp = b.p.expiry ? new Date(b.p.expiry).getTime() : Infinity;
-        if (aExp !== bExp) return aExp - bExp;
-        const aPurchased = a.p.purchasedAt ? new Date(a.p.purchasedAt).getTime() : 0;
-        const bPurchased = b.p.purchasedAt ? new Date(b.p.purchasedAt).getTime() : 0;
-        return aPurchased - bPurchased;
-      });
-
-    let remainingToConsume = Number(usageMb || 0);
-    let consumed = 0;
-
-    for (const item of activePlans) {
-      if (remainingToConsume <= 0) break;
-      const idx = item.idx;
-      const bucket = normalized[idx];
-      const bucketRemaining = Number(bucket.remainingMB != null ? bucket.remainingMB : bucket.dataLimitMB || bucket.dataLimit || 0);
-      if (isNaN(bucketRemaining) || bucketRemaining <= 0) {
-        bucket.remainingMB = 0;
-        bucket.status = "exhausted";
-        continue;
-      }
-      const delta = Math.min(bucketRemaining, remainingToConsume);
-      bucket.remainingMB = Math.max(bucketRemaining - delta, 0);
-      remainingToConsume -= delta;
-      consumed += delta;
-      if (bucket.remainingMB <= 0) {
-        bucket.status = "exhausted";
-      } else {
-        bucket.status = "active";
+      // notify user
+      if (u && u.email) {
+        await sendUserNotification(
+          u.email,
+          "plan_exhausted",
+          "🚫 Your plan has expired or been exhausted. Please purchase a new plan to re-enable VPN access."
+        );
       }
     }
+  } catch (notifyErr) {
+    console.warn("prune: post-transaction notify/disable error:", notifyErr.message || notifyErr);
+  }
 
-    // Update user's dataUsed historical counter
-    const prevDataUsed = Number(u.dataUsed || 0);
-    const newDataUsed = prevDataUsed + consumed;
-
-    // Compute progress and totals after mutation
-    const { totalAllocatedMB, totalRemainingMB, totalUsedMB, progressPercent } = computeProgressFields(normalized);
-    const activeAfter = normalized.filter((p) => p && String(p.status).toLowerCase() === "active");
-    const earliestExpiry = activeAfter.length
-      ? activeAfter
-          .map((p) => (p.expiry ? new Date(p.expiry) : null))
-          .filter(Boolean)
-          .sort((a, b) => a - b)[0]
-      : null;
-
-    const updates = {
-      plans: normalized,
-      dataUsed: newDataUsed,
-      // compatibility fields
-      totalDataDisplay: totalRemainingMB,
-      planLimit: totalRemainingMB,
-      // explicit progress fields
-      totalAllocatedMB,
-      totalRemainingMB,
-      totalUsedMB,
-      progressPercent,
-      expiryDate: earliestExpiry ? earliestExpiry.toISOString() : admin.firestore.FieldValue.delete(),
-      updatedAt: new Date().toISOString(),
-    };
-
-    if (activeAfter.length === 0) updates.vpnActive = false;
-
-    t.update(userRef, updates);
-
-    return {
-      consumed,
-      stillNeeded: Math.max(0, remainingToConsume),
-      totalRemaining: totalRemainingMB,
-      remainingActiveBuckets: activeAfter.length,
-      totalAllocatedMB,
-      totalUsedMB,
-      progressPercent
-    };
-  });
+  return result;
 }
 
 /**
  * Append a plan bucket to a user doc and recompute summary fields (transactional + dedupe).
- * - New bucket will have status 'active'
- * - Writes progress fields for UI: totalAllocatedMB, totalRemainingMB, totalUsedMB, progressPercent
+ * - userRef: DocumentReference
+ * - bucket: { name, dataLimitMB, remainingMB, purchasedAt, expiry, purchaseReference? }
+ *
+ * Returns { skipped: boolean, totalRemaining, plans }
  */
 async function appendPlanBucketForUser(userRef, bucket) {
+  // run a transaction: read current plans, check duplicates, write merged plans + totals atomically
   return db.runTransaction(async (t) => {
     const snap = await t.get(userRef);
     const u = snap.exists ? snap.data() : {};
     const currentPlansRaw = Array.isArray(u.plans) ? [...u.plans] : [];
+
     const now = new Date();
 
-    // Normalize existing plans locally
-    const normalized = currentPlansRaw.map((p) => {
-      if (!p) return p;
-      const copy = { ...p };
-      const remaining = Number(copy.remainingMB != null ? copy.remainingMB : copy.dataLimitMB || copy.dataLimit || 0);
-      let expired = false;
-      if (copy.expiry) {
+    // Filter out expired/empty plans for merging (we don't want expired buckets to roll into new purchase)
+    const currentPlans = currentPlansRaw.filter((p) => {
+      if (!p) return false;
+      const remaining = Number(p.remainingMB != null ? p.remainingMB : p.dataLimitMB || p.dataLimit || 0);
+      if (isNaN(remaining)) return false;
+      if (remaining <= 0) return false;
+      if (p.expiry) {
         try {
-          const exp = new Date(copy.expiry);
-          if (exp < now) expired = true;
-        } catch (e) {}
+          const exp = new Date(p.expiry);
+          if (exp < now) return false;
+        } catch (e) {
+          // if expiry invalid, keep
+        }
       }
-      if (expired) {
-        copy.status = "expired";
-      } else if (isNaN(remaining) || remaining <= 0) {
-        copy.status = "exhausted";
-        copy.remainingMB = Math.max(isNaN(remaining) ? 0 : remaining, 0);
-      } else {
-        copy.status = copy.status ? copy.status : "active";
-      }
-      return copy;
+      return true;
     });
 
-    // Dedupe by purchaseReference across all plans (history included)
+    // 1) If bucket has purchaseReference, skip if any existing plan already has same reference
     if (bucket.purchaseReference) {
-      const existsRef = normalized.some((p) => p && p.purchaseReference === bucket.purchaseReference);
-      if (existsRef) {
-        const { totalRemainingMB } = computeProgressFields(normalized);
-        return { skipped: true, totalRemaining: totalRemainingMB, plans: normalized };
+      const found = currentPlans.some((p) => p && p.purchaseReference === bucket.purchaseReference);
+      if (found) {
+        const totalRemaining = computeTotalRemainingFromPlans(currentPlans);
+        return { skipped: true, totalRemaining, plans: currentPlans };
       }
     }
 
-    // Near-duplicate detection among active plans
-    const activePlans = normalized.filter((p) => p && String(p.status).toLowerCase() === "active");
+    // 2) Additional conservative near-duplicate detection:
+    // if an existing plan has same name + dataLimitMB + expiry + purchasedAt within 5 minutes, treat as duplicate
     const purchasedAtDate = bucket.purchasedAt ? new Date(bucket.purchasedAt).getTime() : null;
-    const nearDup = activePlans.some((p) => {
+    const nearDup = currentPlans.some((p) => {
       try {
         if (!p) return false;
         const sameName = String(p.name || "") === String(bucket.name || "");
@@ -449,44 +335,38 @@ async function appendPlanBucketForUser(userRef, bucket) {
       }
     });
     if (nearDup) {
-      const { totalRemainingMB } = computeProgressFields(normalized);
-      return { skipped: true, totalRemaining: totalRemainingMB, plans: normalized };
+      const totalRemaining = computeTotalRemainingFromPlans(currentPlans);
+      return { skipped: true, totalRemaining, plans: currentPlans };
     }
 
-    // Prepare new bucket and append
-    const newBucket = { ...bucket, status: "active" };
-    const mergedPlans = [...normalized, newBucket];
-
-    const { totalAllocatedMB, totalRemainingMB, totalUsedMB, progressPercent } = computeProgressFields(mergedPlans);
-    const activeAfter = mergedPlans.filter((p) => p && String(p.status).toLowerCase() === "active");
-    const earliestExpiry = activeAfter.length
-      ? activeAfter
+    // 3) Append bucket and recompute totals (we'll keep only non-expired plans + new bucket)
+    const mergedPlans = [...currentPlans, bucket];
+    const totalRemaining = computeTotalRemainingFromPlans(mergedPlans);
+    const earliestExpiry = mergedPlans.length
+      ? mergedPlans
           .map((p) => (p.expiry ? new Date(p.expiry) : null))
           .filter(Boolean)
           .sort((a, b) => a - b)[0]
       : null;
 
+    // write merged plans + summary fields
     const updates = {
       plans: mergedPlans,
-      // compatibility
-      totalDataDisplay: totalRemainingMB,
-      planLimit: totalRemainingMB,
-      // explicit progress
-      totalAllocatedMB,
-      totalRemainingMB,
-      totalUsedMB,
-      progressPercent,
+      totalDataDisplay: totalRemaining,
+      planLimit: totalRemaining,
       expiryDate: earliestExpiry ? earliestExpiry.toISOString() : admin.firestore.FieldValue.delete(),
       updatedAt: new Date().toISOString(),
-      vpnActive: true,
+      vpnActive: true, // re-enable VPN on successful purchase
+      // clear thresholds sent so user can receive 70/98% alerts again after buying
+      notificationsSentThresholds: admin.firestore.FieldValue.delete(),
     };
 
     t.update(userRef, updates);
-    return { skipped: false, totalRemaining: totalRemainingMB, plans: mergedPlans };
+    return { skipped: false, totalRemaining, plans: mergedPlans };
   });
 }
 
-// Migrate legacy fields into plans[] (idempotent) — updated to attach status and progress fields
+// Migrate legacy fields into plans[] (idempotent)
 async function migrateLegacyToPlansIfNeeded(userRef, userData) {
   try {
     const existingPlans = Array.isArray(userData.plans) ? [...userData.plans] : [];
@@ -501,16 +381,14 @@ async function migrateLegacyToPlansIfNeeded(userRef, userData) {
       });
       if (!present) {
         const rem = Math.max((userData.planLimit || 0) - (userData.dataUsed || 0), 0);
-        const expiry = userData.expiryDate || null;
-        const status = expiry && new Date(expiry) < new Date() ? "expired" : (rem <= 0 ? "exhausted" : "active");
         migrationBuckets.push({
           name: userData.currentPlan || "Legacy Plan",
           dataLimitMB: Number(userData.planLimit || 0),
           remainingMB: Number(rem),
           purchasedAt: userData.lastPayment?.date || new Date().toISOString(),
-          expiry,
+          expiry: userData.expiryDate || null,
+          // attach lastPayment.reference if present — helps avoid duplicate later
           purchaseReference: userData.lastPayment?.reference || undefined,
-          status,
         });
       }
     }
@@ -525,7 +403,6 @@ async function migrateLegacyToPlansIfNeeded(userRef, userData) {
       });
       if (!presentPending) {
         const expiry = p.expiryDate || p.expiry || null;
-        const status = expiry && new Date(expiry) < new Date() ? "expired" : "active";
         migrationBuckets.push({
           name: p.name || "Pending Plan",
           dataLimitMB: Number(p.dataLimit || 0),
@@ -533,14 +410,13 @@ async function migrateLegacyToPlansIfNeeded(userRef, userData) {
           purchasedAt: p.purchasedAt || new Date().toISOString(),
           expiry,
           purchaseReference: p.reference || p.purchaseReference || undefined,
-          status,
         });
       }
     }
 
     if (migrationBuckets.length > 0) {
       const mergedPlans = [...existingPlans, ...migrationBuckets];
-      const { totalAllocatedMB, totalRemainingMB, totalUsedMB, progressPercent } = computeProgressFields(mergedPlans);
+      const totalRemaining = computeTotalRemainingFromPlans(mergedPlans);
       const earliestExpiry = mergedPlans.length
         ? mergedPlans
             .map((p) => (p.expiry ? new Date(p.expiry) : null))
@@ -551,17 +427,15 @@ async function migrateLegacyToPlansIfNeeded(userRef, userData) {
       // update user doc: set plans[], totalDataDisplay, clear legacy fields to avoid repeated migrations
       await userRef.update({
         plans: mergedPlans,
-        totalDataDisplay: totalRemainingMB,
-        planLimit: totalRemainingMB,
-        totalAllocatedMB,
-        totalRemainingMB,
-        totalUsedMB,
-        progressPercent,
+        totalDataDisplay: totalRemaining,
+        planLimit: totalRemaining,
         expiryDate: earliestExpiry ? earliestExpiry.toISOString() : admin.firestore.FieldValue.delete(),
         pendingPlan: admin.firestore.FieldValue.delete(),
         currentPlan: admin.firestore.FieldValue.delete(),
         dataUsed: admin.firestore.FieldValue.delete(),
         updatedAt: new Date().toISOString(),
+        // clear previous threshold notifications so user can get fresh ones
+        notificationsSentThresholds: admin.firestore.FieldValue.delete(),
       });
 
       console.log(`Migrated ${migrationBuckets.length} legacy bucket(s) into plans[] for ${userRef.id}`);
@@ -667,7 +541,7 @@ async function setNodeOnline(nodeDocRef, online) {
 }
 
 // ----------------------------
-// PAYSTACK WEBHOOK (UPDATED: idempotent + migration into plans[] + normalize before append)
+// PAYSTACK WEBHOOK (UPDATED: idempotent + migration into plans[] + prune expired buckets)
 // NOTE: changed to use txRef.create() to avoid race-duplicates
 app.post(
   "/payments/webhook",
@@ -800,11 +674,11 @@ app.post(
         console.warn("Legacy migration error (non-fatal):", e.message || e);
       }
 
-      // --- NORMALIZE statuses BEFORE appending new purchase
+      // --- PRUNE expired/empty buckets BEFORE appending new purchase
       try {
-        await normalizeBucketStatuses(userRef);
+        await pruneExpiredAndEmptyBuckets(userRef);
       } catch (e) {
-        console.warn("normalize before append failed (non-fatal):", e.message || e);
+        console.warn("prune before append failed (non-fatal):", e.message || e);
       }
 
       // Build new bucket (attach transaction reference for traceability)
@@ -851,6 +725,8 @@ app.post(
           vpnActive: true,
           lastPayment: { amount, reference, date: now.toISOString() },
           updatedAt: new Date().toISOString(),
+          // clear notificationsSentThresholds on purchase to re-enable 70/98 alerts
+          notificationsSentThresholds: admin.firestore.FieldValue.delete(),
         });
 
         console.log(`✅ ${email} purchased ${plan.name} — bucket appended. totalRemaining=${appendRes.totalRemaining}`);
@@ -915,36 +791,6 @@ app.get("/admin/summary", async (_, res) => {
     res.json({ total, active, expired, withPlan });
   } catch (err) {
     console.error("admin/summary error:", err.message || err);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-/**
- * Admin one-off endpoint: normalize & migrate all users
- * - runs migrateLegacyToPlansIfNeeded + normalizeBucketStatuses for each user
- * - use once (or occasionally) to update old accounts
- */
-app.post("/admin/fix-all-plans", requireAdmin, async (req, res) => {
-  try {
-    const snap = await db.collection("users").get();
-    let processed = 0, migrated = 0, normalized = 0, errors = 0;
-    for (const doc of snap.docs) {
-      const ref = doc.ref;
-      const data = doc.data() || {};
-      try {
-        const mig = await migrateLegacyToPlansIfNeeded(ref, data);
-        if (mig && mig.migrated) migrated++;
-        const norm = await normalizeBucketStatuses(ref);
-        if (norm && norm.updated) normalized++;
-        processed++;
-      } catch (e) {
-        console.warn(`admin/fix-all-plans error for ${doc.id}:`, e.message || e);
-        errors++;
-      }
-    }
-    res.json({ success: true, processed, migrated, normalized, errors });
-  } catch (err) {
-    console.error("/admin/fix-all-plans error:", err.message || err);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1118,7 +964,7 @@ app.get("/vpn/status/:uid", async (req, res) => {
 });
 
 // ----------------------
-// Existing VPN session handlers (connect/disconnect/update-usage) - updated to use bucket consumption
+// Existing VPN session handlers (connect/disconnect/update-usage) - kept mostly as-is
 app.post("/vpn/session/connect", async (req, res) => {
   try {
     const { username, vpn_ip } = req.body;
@@ -1165,9 +1011,6 @@ app.post("/vpn/session/connect", async (req, res) => {
   }
 });
 
-/**
- * Disconnect endpoint: consume data_used_mb from active buckets first, then update vpnActive flag.
- */
 app.post("/vpn/session/disconnect", async (req, res) => {
   try {
     const { username, data_used_mb = 0 } = req.body;
@@ -1177,34 +1020,38 @@ app.post("/vpn/session/disconnect", async (req, res) => {
     const doc = snap.docs[0];
     const uRef = doc.ref;
 
-    // Normalize statuses first so planLimit reflects active buckets
+    // prune expired/empty buckets first to ensure planLimit reflects only active buckets
     try {
-      await normalizeBucketStatuses(uRef);
+      await pruneExpiredAndEmptyBuckets(uRef);
     } catch (e) {
-      console.warn("disconnect: normalize failed (non-fatal):", e.message || e);
+      console.warn("disconnect: prune failed (non-fatal):", e.message || e);
     }
 
-    // Consume usage from buckets transactionally
-    let consumeRes = { consumed: 0, stillNeeded: data_used_mb, totalRemaining: 0, remainingActiveBuckets: 0 };
-    try {
-      consumeRes = await consumeUsageFromBuckets(uRef, Number(data_used_mb || 0));
-    } catch (e) {
-      console.warn("disconnect: consumeUsageFromBuckets failed (non-fatal):", e.message || e);
-    }
-
-    // After consumption, get updated user document to determine vpnActive/expiry
+    // re-fetch user after prune
     const after = await uRef.get();
     const u = after.exists ? after.data() : {};
 
-    const over = (u.planLimit || 0) <= 0;
+    const used = (u.dataUsed || 0) + data_used_mb;
+    const over = used >= (u.planLimit || Infinity);
     const expired = u.expiryDate && new Date(u.expiryDate) < new Date();
 
-    // Ensure vpnActive respects status
     await uRef.update({
+      dataUsed: used,
       vpnActive: !over && !expired,
       lastDisconnect: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     });
+
+    // compute percent for threshold notifications (avoid divide by zero)
+    const planLimitForPercent = (u.planLimit || 0);
+    if (planLimitForPercent > 0) {
+      const percent = (used / planLimitForPercent) * 100;
+      try {
+        await sendThresholdNotifications(uRef, u.email || username, percent);
+      } catch (e) {
+        console.warn("disconnect: sendThresholdNotifications failed:", e.message || e);
+      }
+    }
 
     if (over || expired) {
       // disable both local VPN and tailscale device
@@ -1226,16 +1073,13 @@ app.post("/vpn/session/disconnect", async (req, res) => {
       );
     }
 
-    res.json({ success: true, consumed: consumeRes.consumed, remainingActiveBuckets: consumeRes.remainingActiveBuckets, totalRemaining: consumeRes.totalRemaining, totalAllocatedMB: consumeRes.totalAllocatedMB, totalUsedMB: consumeRes.totalUsedMB, progressPercent: consumeRes.progressPercent });
+    res.json({ success: true });
   } catch (err) {
     console.error("Disconnect error:", err.message || err);
     res.status(500).json({ error: err.message });
   }
 });
 
-/**
- * update-usage endpoint: consume usage, send near-limit / exhausted notifications
- */
 app.post("/vpn/session/update-usage", async (req, res) => {
   try {
     const { username, usage_mb = 0 } = req.body;
@@ -1245,36 +1089,43 @@ app.post("/vpn/session/update-usage", async (req, res) => {
     const doc = snap.docs[0];
     const uRef = doc.ref;
 
-    // Normalize statuses first so planLimit reflects active buckets
+    // prune expired/empty buckets first to ensure planLimit reflects only active buckets
     try {
-      await normalizeBucketStatuses(uRef);
+      await pruneExpiredAndEmptyBuckets(uRef);
     } catch (e) {
-      console.warn("update-usage: normalize failed (non-fatal):", e.message || e);
+      console.warn("update-usage: prune failed (non-fatal):", e.message || e);
     }
 
-    // Consume usage transactionally
-    const consumeRes = await consumeUsageFromBuckets(uRef, Number(usage_mb || 0));
-
-    // Re-fetch user after consumption to compute percent
+    // re-fetch user after prune
     const after = await uRef.get();
     const u = after.exists ? after.data() : {};
-    const used = Number(u.totalUsedMB || (u.totalAllocatedMB - (u.totalRemainingMB || 0)) || u.dataUsed || 0);
-    const totalAllocated = Number(u.totalAllocatedMB || 0);
-    const percent = totalAllocated > 0 ? (used / totalAllocated) * 100 : 100;
+
+    const used = (u.dataUsed || 0) + usage_mb;
+    const percent = (used / (u.planLimit || 1)) * 100;
+
+    // send threshold notifications (70%, 98%, etc.)
+    try {
+      await sendThresholdNotifications(uRef, u.email || username, percent);
+    } catch (e) {
+      console.warn("update-usage: sendThresholdNotifications failed:", e.message || e);
+    }
+
+    const percentForNotify = percent; // numeric percent for clarity
 
     if (percent >= 90 && percent < 100) {
+      // legacy near-limit handler (kept for compatibility) — still useful for >=90
       await sendUserNotification(
         username,
         "plan_near_limit",
-        `⚠️ You've used ${percent.toFixed(0)}% of your active plan(s).`
+        `⚠️ You've used ${percentForNotify.toFixed(0)}% of your plan.`
       );
     }
 
-    const over = (u.planLimit || 0) <= 0;
+    const over = used >= (u.planLimit || Infinity);
     const expired = u.expiryDate && new Date(u.expiryDate) < new Date();
 
-    // Ensure vpnActive flag correct
     await uRef.update({
+      dataUsed: used,
       vpnActive: !over && !expired,
       updatedAt: new Date().toISOString(),
     });
@@ -1298,7 +1149,7 @@ app.post("/vpn/session/update-usage", async (req, res) => {
       );
     }
 
-    res.json({ success: true, consumed: consumeRes.consumed, stillNeeded: consumeRes.stillNeeded, totalRemaining: consumeRes.totalRemaining, totalAllocatedMB: consumeRes.totalAllocatedMB, totalUsedMB: consumeRes.totalUsedMB, progressPercent: consumeRes.progressPercent });
+    res.json({ success: true });
   } catch (err) {
     console.error("Usage update error:", err.message || err);
     res.status(500).json({ error: err.message });
@@ -1316,19 +1167,19 @@ app.all("/cron/expire-check", async (_, res) => {
     for (const doc of snap.docs) {
       const userRef = doc.ref;
 
-      // Normalize buckets for each user (mark expired/exhausted and update totals)
+      // Prune expired/empty buckets for each user
       try {
-        const pr = await normalizeBucketStatuses(userRef);
-        // if normalization left zero active plans, increment disabled and ensure VPN disabled
+        const pr = await pruneExpiredAndEmptyBuckets(userRef);
+        // if pruning left zero active plans, increment disabled and ensure VPN disabled
         if (pr.remainingCount === 0) {
           disabled++;
         }
       } catch (e) {
-        console.warn(`cron normalize error for ${doc.id}:`, e.message || e);
+        console.warn(`cron prune error for ${doc.id}:`, e.message || e);
       }
     }
 
-    res.status(200).send(`✅ Normalized plans for ${snap.size} users; ${disabled} users disabled (no active plans)`);
+    res.status(200).send(`✅ Disabled ${disabled} users`);
   } catch (err) {
     console.error("Cron expire-check error:", err.message || err);
     res.status(500).send(err.message);
