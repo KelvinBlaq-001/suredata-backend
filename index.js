@@ -151,6 +151,15 @@ async function _tryTailscaleRequest(url, options = {}) {
 }
 
 async function tailscaleEnableDevice(deviceId) {
+  // Respect an environment toggle so we don't hammer the Tailscale API in environments
+  // where control isn't configured (e.g. during early testing). Set TAILSCALE_CONTROL_ENABLED=true
+  // in your Render/.env to enable real API calls.
+  const controlEnabled = String(process.env.TAILSCALE_CONTROL_ENABLED || "false").toLowerCase() === "true";
+  if (!controlEnabled) {
+    console.log(`tailscaleEnableDevice: skipped because TAILSCALE_CONTROL_ENABLED != true for device ${deviceId}`);
+    return { ok: false, error: "tailscale control disabled by environment" };
+  }
+
   const tailnet = process.env.TAILSCALE_TAILNET;
   const headers = { Authorization: _tailscaleAuthHeader(), "Content-Type": "application/json" };
 
@@ -184,7 +193,17 @@ async function tailscaleEnableDevice(deviceId) {
   return { ok: false, error: lastErr || "unknown" };
 }
 
+  // Final fallback: do not block — log and return not-ok with the last error
+  return { ok: false, error: lastErr || "unknown" };
+}
+
 async function tailscaleDisableDevice(deviceId) {
+  const controlEnabled = String(process.env.TAILSCALE_CONTROL_ENABLED || "false").toLowerCase() === "true";
+  if (!controlEnabled) {
+    console.log(`tailscaleDisableDevice: skipped because TAILSCALE_CONTROL_ENABLED != true for device ${deviceId}`);
+    return { ok: false, error: "tailscale control disabled by environment" };
+  }
+
   const tailnet = process.env.TAILSCALE_TAILNET;
   const headers = { Authorization: _tailscaleAuthHeader(), "Content-Type": "application/json" };
 
@@ -210,6 +229,9 @@ async function tailscaleDisableDevice(deviceId) {
     lastErr = `attempt ${c.url} -> ${r.status || "err"}: ${r.body || r.error}`;
     console.warn("tailscaleDisableDevice attempt failed:", lastErr);
   }
+
+  return { ok: false, error: lastErr || "unknown" };
+}
 
   return { ok: false, error: lastErr || "unknown" };
 }
