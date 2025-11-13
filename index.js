@@ -129,112 +129,63 @@ async function tailscaleListDevices() {
   }
 }
 
-/**
- * Tailscale enable/disable helpers
- *
- * The Tailscale API surface can differ over time and between accounts. Historically some helper
- * endpoints (like `/device/.../enable`) may return 404. To be robust we try a small set of
- * likely endpoints and fall back to a best-effort PATCH that attempts to set an "authorized" flag.
- * If every attempt fails we return a structured error — the rest of the backend treats this as
- * "best-effort" (we don't block the user assignment because the Tailscale API might not be available
- * for your account).
- */
-async function _tryTailscaleRequest(url, options = {}) {
-  try {
-    const res = await fetch(url, options);
-    if (res.ok) return { ok: true, status: res.status, body: await res.text() };
-    const text = await res.text();
-    return { ok: false, status: res.status, body: text };
-  } catch (e) {
-    return { ok: false, error: e.message || String(e) };
-  }
-}
-
+// Debug-friendly Tailscale enable/disable (replace existing functions)
 async function tailscaleEnableDevice(deviceId) {
-  // Respect an environment toggle so we don't hammer the Tailscale API in environments
-  // where control isn't configured (e.g. during early testing). Set TAILSCALE_CONTROL_ENABLED=true
-  // in your Render/.env to enable real API calls.
-  const controlEnabled = String(process.env.TAILSCALE_CONTROL_ENABLED || "false").toLowerCase() === "true";
-  if (!controlEnabled) {
-    console.log(`tailscaleEnableDevice: skipped because TAILSCALE_CONTROL_ENABLED != true for device ${deviceId}`);
-    return { ok: false, error: "tailscale control disabled by environment" };
-  }
-
   const tailnet = process.env.TAILSCALE_TAILNET;
-  const headers = { Authorization: _tailscaleAuthHeader(), "Content-Type": "application/json" };
-
-  const candidates = [];
-  if (tailnet) {
-    candidates.push({ url: `${BASE_URL}/tailnet/${encodeURIComponent(tailnet)}/devices/${encodeURIComponent(deviceId)}/enable`, method: "POST" });
-    candidates.push({ url: `${BASE_URL}/tailnet/${encodeURIComponent(tailnet)}/devices/${encodeURIComponent(deviceId)}:enable`, method: "POST" });
-    // PATCH to /tailnet/{tailnet}/devices/{id} with {authorized:true}
-    candidates.push({ url: `${BASE_URL}/tailnet/${encodeURIComponent(tailnet)}/devices/${encodeURIComponent(deviceId)}`, method: "PATCH", body: JSON.stringify({ authorized: true }) });
+  if (!tailnet) {
+    console.warn("tailscaleEnableDevice: TAILSCALE_TAILNET not set");
+    return { ok: false, error: "tailnet_missing" };
   }
-  // Non-tailnet variants (some docs/examples differ)
-  candidates.push({ url: `${BASE_URL}/devices/${encodeURIComponent(deviceId)}/enable`, method: "POST" });
-  candidates.push({ url: `${BASE_URL}/device/${encodeURIComponent(deviceId)}/enable`, method: "POST" });
-  candidates.push({ url: `${BASE_URL}/devices/${encodeURIComponent(deviceId)}`, method: "PATCH", body: JSON.stringify({ authorized: true }) });
 
-  let lastErr = null;
-  for (const c of candidates) {
-    const opts = { method: c.method, headers };
-    if (c.body) opts.body = c.body;
-    const r = await _tryTailscaleRequest(c.url, opts);
-    if (r.ok) {
-      console.log(`tailscaleEnableDevice: succeeded via ${c.url}`);
-      return { ok: true };
+  const attempts = [
+    // canonical path per API
+    `${BASE_URL}/tailnet/${encodeURIComponent(tailnet)}/devices/${encodeURIComponent(deviceId)}/enable`,
+    // fallback attempts for visibility
+    `${BASE_URL}/devices/${encodeURIComponent(deviceId)}/enable`,
+    `${BASE_URL}/device/${encodeURIComponent(deviceId)}/enable`,
+  ];
+
+  for (const url of attempts) {
+    try {
+      const res = await fetch(url, { method: "POST", headers: { Authorization: _tailscaleAuthHeader() } });
+      const text = await res.text().catch(() => "");
+      console.log(`tailscaleEnableDevice attempt: ${url} -> ${res.status} ${res.statusText} ; body: ${text}`);
+      if (res.ok) return { ok: true, status: res.status, body: text };
+    } catch (err) {
+      console.warn(`tailscaleEnableDevice attempt error for ${url}:`, err.message || err);
     }
-    lastErr = `attempt ${c.url} -> ${r.status || "err"}: ${r.body || r.error}`;
-    console.warn("tailscaleEnableDevice attempt failed:", lastErr);
-    // if 404/403, continue trying other candidates
   }
 
-  // Final fallback: do not block — log and return not-ok with the last error
-  return { ok: false, error: lastErr || "unknown" };
-}
-
-  // Final fallback: do not block — log and return not-ok with the last error
-  return { ok: false, error: lastErr || "unknown" };
+  return { ok: false, error: "all_attempts_failed" };
 }
 
 async function tailscaleDisableDevice(deviceId) {
-  const controlEnabled = String(process.env.TAILSCALE_CONTROL_ENABLED || "false").toLowerCase() === "true";
-  if (!controlEnabled) {
-    console.log(`tailscaleDisableDevice: skipped because TAILSCALE_CONTROL_ENABLED != true for device ${deviceId}`);
-    return { ok: false, error: "tailscale control disabled by environment" };
-  }
-
   const tailnet = process.env.TAILSCALE_TAILNET;
-  const headers = { Authorization: _tailscaleAuthHeader(), "Content-Type": "application/json" };
-
-  const candidates = [];
-  if (tailnet) {
-    candidates.push({ url: `${BASE_URL}/tailnet/${encodeURIComponent(tailnet)}/devices/${encodeURIComponent(deviceId)}/disable`, method: "POST" });
-    candidates.push({ url: `${BASE_URL}/tailnet/${encodeURIComponent(tailnet)}/devices/${encodeURIComponent(deviceId)}:disable`, method: "POST" });
-    candidates.push({ url: `${BASE_URL}/tailnet/${encodeURIComponent(tailnet)}/devices/${encodeURIComponent(deviceId)}`, method: "PATCH", body: JSON.stringify({ authorized: false }) });
+  if (!tailnet) {
+    console.warn("tailscaleDisableDevice: TAILSCALE_TAILNET not set");
+    return { ok: false, error: "tailnet_missing" };
   }
-  candidates.push({ url: `${BASE_URL}/devices/${encodeURIComponent(deviceId)}/disable`, method: "POST" });
-  candidates.push({ url: `${BASE_URL}/device/${encodeURIComponent(deviceId)}/disable`, method: "POST" });
-  candidates.push({ url: `${BASE_URL}/devices/${encodeURIComponent(deviceId)}`, method: "PATCH", body: JSON.stringify({ authorized: false }) });
 
-  let lastErr = null;
-  for (const c of candidates) {
-    const opts = { method: c.method, headers };
-    if (c.body) opts.body = c.body;
-    const r = await _tryTailscaleRequest(c.url, opts);
-    if (r.ok) {
-      console.log(`tailscaleDisableDevice: succeeded via ${c.url}`);
-      return { ok: true };
+  const attempts = [
+    `${BASE_URL}/tailnet/${encodeURIComponent(tailnet)}/devices/${encodeURIComponent(deviceId)}/disable`,
+    `${BASE_URL}/devices/${encodeURIComponent(deviceId)}/disable`,
+    `${BASE_URL}/device/${encodeURIComponent(deviceId)}/disable`,
+  ];
+
+  for (const url of attempts) {
+    try {
+      const res = await fetch(url, { method: "POST", headers: { Authorization: _tailscaleAuthHeader() } });
+      const text = await res.text().catch(() => "");
+      console.log(`tailscaleDisableDevice attempt: ${url} -> ${res.status} ${res.statusText} ; body: ${text}`);
+      if (res.ok) return { ok: true, status: res.status, body: text };
+    } catch (err) {
+      console.warn(`tailscaleDisableDevice attempt error for ${url}:`, err.message || err);
     }
-    lastErr = `attempt ${c.url} -> ${r.status || "err"}: ${r.body || r.error}`;
-    console.warn("tailscaleDisableDevice attempt failed:", lastErr);
   }
 
-  return { ok: false, error: lastErr || "unknown" };
+  return { ok: false, error: "all_attempts_failed" };
 }
 
-  return { ok: false, error: lastErr || "unknown" };
-}
 
 // ----------------------
 // === ADDED HELPERS: plan-bucket utilities, status + consumption + migration helpers + progress fields ===
