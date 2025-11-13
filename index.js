@@ -668,7 +668,7 @@ async function pickBestNode() {
   return q.docs[0];
 }
 
-// assign node: mark status=in_use, assignedTo=userEmail (or uid), increment load slightly
+// assign node: mark status=in_use, assignedTo:userEmail (or uid), increment load slightly
 async function assignNodeToUser(nodeDocRef, userIdOrEmail) {
   const doc = await nodeDocRef.get();
   if (!doc.exists) throw new Error("node missing");
@@ -704,6 +704,88 @@ async function setNodeOnline(nodeDocRef, online) {
     online,
     lastChecked: admin.firestore.FieldValue.serverTimestamp(),
   });
+}
+
+/**
+ * backendActivateBridgeForUser(userIdentifier, nodeDocRef)
+ * - Attempts to enable the tailscale device via API
+ * - Updates the user document with vpnDeviceId/vpnAssignedNodeId/vpnBridgeActive
+ * - Writes lastBridgeActivatedAt on node doc
+ *
+ * userIdentifier: either email (contains '@') or uid (doc id)
+ * nodeDocRef: DocumentReference for tailscale_nodes doc
+ */
+async function backendActivateBridgeForUser(userIdentifier, nodeDocRef) {
+  try {
+    if (!nodeDocRef) {
+      console.warn("backendActivateBridgeForUser: missing nodeDocRef");
+      return { ok: false, reason: "missing_node_ref" };
+    }
+
+    // Ensure node exists
+    const nodeSnap = await nodeDocRef.get();
+    if (!nodeSnap.exists) {
+      console.warn("backendActivateBridgeForUser: node doc missing");
+      return { ok: false, reason: "node_missing" };
+    }
+    const nodeData = nodeSnap.data() || {};
+    const deviceId = nodeDocRef.id;
+
+    // Try to enable the device on Tailscale (best-effort)
+    let enableRes = { ok: false };
+    try {
+      enableRes = await tailscaleEnableDevice(deviceId);
+      if (!enableRes.ok) {
+        console.warn(`backendActivateBridgeForUser: tailscaleEnableDevice returned not ok for device ${deviceId}`, enableRes.error || "");
+      } else {
+        console.log(`backendActivateBridgeForUser: tailscale device ${deviceId} enabled via API`);
+      }
+    } catch (e) {
+      console.warn("backendActivateBridgeForUser: tailscaleEnableDevice exception:", e.message || e);
+    }
+
+    // find userRef (prefer email if identifier contains '@', else try doc id)
+    let userRef = null;
+    if (typeof userIdentifier === "string" && userIdentifier.includes("@")) {
+      const q = await db.collection("users").where("email", "==", userIdentifier).limit(1).get();
+      if (!q.empty) userRef = q.docs[0].ref;
+    } else if (typeof userIdentifier === "string" && userIdentifier.length > 0) {
+      const doc = await db.collection("users").doc(userIdentifier).get();
+      if (doc.exists) userRef = doc.ref;
+    }
+
+    if (!userRef) {
+      console.warn("backendActivateBridgeForUser: user not found for identifier", userIdentifier);
+      return { ok: false, reason: "user_not_found" };
+    }
+
+    // Update user doc with bridge info (best-effort)
+    try {
+      await userRef.update({
+        vpnDeviceId: deviceId,
+        vpnAssignedNodeId: deviceId,
+        vpnBridgeActive: true,
+        vpnBridgeActivatedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+    } catch (e) {
+      console.warn("backendActivateBridgeForUser: failed to update user doc:", e.message || e);
+    }
+
+    // Note last activation on node doc
+    try {
+      await nodeDocRef.update({
+        lastBridgeActivatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+    } catch (e) {
+      console.warn("backendActivateBridgeForUser: failed to update node doc:", e.message || e);
+    }
+
+    return { ok: true, enabled: !!enableRes.ok };
+  } catch (e) {
+    console.warn("backendActivateBridgeForUser error:", e.message || e);
+    return { ok: false, error: e.message || String(e) };
+  }
 }
 
 // ----------------------------
@@ -1085,6 +1167,14 @@ app.post("/vpn/node/auto-assign", requireAdmin, async (req, res) => {
           active: true,
           user: email || uid || null,
         });
+
+        // Activate backend-managed Bridge for user (best-effort)
+        try {
+          await backendActivateBridgeForUser(userIdentifier, docRef);
+        } catch (e) {
+          console.warn("auto-assign: backendActivateBridgeForUser failed:", e.message || e);
+        }
+
         return res.json({ success: true, assigned: docRef.id, details: r });
       }
     }
@@ -1099,6 +1189,13 @@ app.post("/vpn/node/auto-assign", requireAdmin, async (req, res) => {
       active: true,
       user: email || uid || null,
     });
+
+    // Activate backend-managed Bridge for user (best-effort)
+    try {
+      await backendActivateBridgeForUser(userIdentifier, docRef);
+    } catch (e) {
+      console.warn("auto-assign: backendActivateBridgeForUser failed:", e.message || e);
+    }
 
     res.json({ success: true, deviceId: docRef.id, details: assignRes });
   } catch (err) {
@@ -1191,6 +1288,13 @@ app.post("/vpn/session/connect", async (req, res) => {
               active: true,
               user: user.email || uidOrEmail,
             });
+
+            // Activate backend-managed Bridge for user (best-effort)
+            try {
+              await backendActivateBridgeForUser(uidOrEmail, pick.ref);
+            } catch (e) {
+              console.warn("connect: backendActivateBridgeForUser failed:", e.message || e);
+            }
           }
         }
       }
