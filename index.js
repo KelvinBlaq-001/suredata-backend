@@ -631,6 +631,9 @@ async function migrateLegacyToPlansIfNeeded(userRef, userData) {
     return { migrated: false, error: e.message || String(e) };
   }
 }
+// === END ADDED HELPERS ===
+// ----------------------
+
 
 // ----------------------
 // Node management helpers (Firestore: tailscale_nodes)
@@ -1049,7 +1052,7 @@ app.post("/admin/fix-all-plans", requireAdmin, async (req, res) => {
 
 // ----------------------
 // Tailscale & Node Endpoints (rest of file unchanged)
-// ...
+// ----------------------
 
 // Seed nodes
 app.post("/tailscale/seed-nodes", requireAdmin, async (req, res) => {
@@ -1216,7 +1219,315 @@ app.get("/vpn/status/:uid", async (req, res) => {
   }
 });
 
-// The remaining endpoints (connect/disconnect/update-usage/cron/etc.) are identical to previous implementation — kept for brevity in this canvas but unchanged in behavior.
+// ----------------------
+// Existing VPN session handlers (connect/disconnect/update-usage) - updated to use bucket consumption
+app.post("/vpn/session/connect", async (req, res) => {
+  try {
+    const { username, vpn_ip } = req.body;
+    const snap = await db.collection("users").where("email", "==", username).limit(1).get();
+    if (snap.empty) return res.status(404).json({ error: "User not found" });
+
+    const docRef = snap.docs[0].ref;
+    await docRef.update({
+      vpnActive: true,
+      vpnIP: vpn_ip,
+      lastConnect: new Date().toISOString(),
+    });
+
+    // optional: ensure tailscale device enabled when user connects (try to use stored vpnDeviceId)
+    try {
+      const user = snap.docs[0].data();
+      if (user && user.vpnDeviceId) {
+        await tailscaleEnableDevice(user.vpnDeviceId);
+      } else {
+        // attempt to auto-assign a node if none assigned (best-effort)
+        const uidOrEmail = user.uid || user.email;
+        const existingSession = await db.collection("vpn_sessions").doc(uidOrEmail).get();
+        if (!existingSession.exists) {
+          const pick = await pickBestNode();
+          if (pick) {
+            await assignNodeToUser(pick.ref, uidOrEmail);
+            await db.collection("vpn_sessions").doc(uidOrEmail).set({
+              nodeId: pick.ref.id,
+              assignedAt: new Date().toISOString(),
+              active: true,
+              user: user.email || uidOrEmail,
+            });
+
+            // Activate backend-managed Bridge for user (best-effort)
+            try {
+              await backendActivateBridgeForUser(uidOrEmail, pick.ref);
+            } catch (e) {
+              console.warn("connect: backendActivateBridgeForUser failed:", e.message || e);
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("connect: tailscale enable attempt failed:", err.message || err);
+    }
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Connect error:", err.message || err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * Disconnect endpoint: consume data_used_mb from active buckets first, then update vpnActive flag.
+ */
+app.post("/vpn/session/disconnect", async (req, res) => {
+  try {
+    const { username, data_used_mb = 0 } = req.body;
+    const snap = await db.collection("users").where("email", "==", username).limit(1).get();
+    if (snap.empty) return res.status(404).json({ error: "User not found" });
+
+    const doc = snap.docs[0];
+    const uRef = doc.ref;
+
+    // Normalize statuses first so planLimit reflects active buckets
+    try {
+      await normalizeBucketStatuses(uRef);
+    } catch (e) {
+      console.warn("disconnect: normalize failed (non-fatal):", e.message || e);
+    }
+
+    // Consume usage from buckets transactionally
+    let consumeRes = { consumed: 0, stillNeeded: data_used_mb, totalRemaining: 0, remainingActiveBuckets: 0 };
+    try {
+      consumeRes = await consumeUsageFromBuckets(uRef, Number(data_used_mb || 0));
+    } catch (e) {
+      console.warn("disconnect: consumeUsageFromBuckets failed (non-fatal):", e.message || e);
+    }
+
+    // After consumption, get updated user document to determine vpnActive/expiry
+    const after = await uRef.get();
+    const u = after.exists ? after.data() : {};
+
+    // Compute percent (use progressPercent if present)
+    const used = Number(u.totalUsedMB || (u.totalAllocatedMB - (u.totalRemainingMB || 0)) || u.dataUsed || 0);
+    const totalAllocated = Number(u.totalAllocatedMB || 0);
+    const percent = totalAllocated > 0 ? (used / totalAllocated) * 100 : 100;
+
+    // Send threshold notifications (70%, 98%)
+    try {
+      await sendThresholdNotifications(uRef, u.email || username, percent);
+    } catch (e) {
+      console.warn("disconnect: sendThresholdNotifications failed:", e.message || e);
+    }
+
+    const over = (u.planLimit || 0) <= 0;
+    const expired = u.expiryDate && new Date(u.expiryDate) < new Date();
+
+    // Ensure vpnActive respects status
+    await uRef.update({
+      vpnActive: !over && !expired,
+      lastDisconnect: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+
+    if (over || expired) {
+      // disable both local VPN and tailscale device
+      try {
+        if (typeof disableVPNAccess === "function") {
+          await disableVPNAccess(username);
+        } else {
+          console.log("disableVPNAccess not defined; skipping external VPN disable.");
+        }
+      } catch (e) {
+        console.warn("disconnect: disableVPNAccess error:", e.message || e);
+      }
+      await sendUserNotification(
+        username,
+        "plan_exhausted",
+        expired
+          ? "Your plan has expired. Please renew."
+          : "Your data limit has been exhausted. Please purchase a new plan to continue using VPN."
+      );
+    }
+
+    res.json({ success: true, consumed: consumeRes.consumed, remainingActiveBuckets: consumeRes.remainingActiveBuckets, totalRemaining: consumeRes.totalRemaining, totalAllocatedMB: consumeRes.totalAllocatedMB, totalUsedMB: consumeRes.totalUsedMB, progressPercent: consumeRes.progressPercent });
+  } catch (err) {
+    console.error("Disconnect error:", err.message || err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+/**
+ * update-usage endpoint: consume usage, send near-limit / exhausted notifications
+ */
+app.post("/vpn/session/update-usage", async (req, res) => {
+  try {
+    const { username, usage_mb = 0 } = req.body;
+    const snap = await db.collection("users").where("email", "==", username).limit(1).get();
+    if (snap.empty) return res.status(404).json({ error: "User not found" });
+
+    const doc = snap.docs[0];
+    const uRef = doc.ref;
+
+    // Normalize statuses first so planLimit reflects active buckets
+    try {
+      await normalizeBucketStatuses(uRef);
+    } catch (e) {
+      console.warn("update-usage: normalize failed (non-fatal):", e.message || e);
+    }
+
+    // Consume usage transactionally
+    const consumeRes = await consumeUsageFromBuckets(uRef, Number(usage_mb || 0));
+
+    // Re-fetch user after consumption to compute percent
+    const after = await uRef.get();
+    const u = after.exists ? after.data() : {};
+    const used = Number(u.totalUsedMB || (u.totalAllocatedMB - (u.totalRemainingMB || 0)) || u.dataUsed || 0);
+    const totalAllocated = Number(u.totalAllocatedMB || 0);
+    const percent = totalAllocated > 0 ? (used / totalAllocated) * 100 : 100;
+
+    // send threshold notifications (70%, 98%, recorded)
+    try {
+      await sendThresholdNotifications(uRef, u.email || username, percent);
+    } catch (e) {
+      console.warn("update-usage: sendThresholdNotifications failed:", e.message || e);
+    }
+
+    if (percent >= 90 && percent < 100) {
+      await sendUserNotification(
+        username,
+        "plan_near_limit",
+        `⚠️ You've used ${percent.toFixed(0)}% of your active plan(s).`
+      );
+    }
+
+    const over = (u.planLimit || 0) <= 0;
+    const expired = u.expiryDate && new Date(u.expiryDate) < new Date();
+
+    // Ensure vpnActive flag correct
+    await uRef.update({
+      vpnActive: !over && !expired,
+      updatedAt: new Date().toISOString(),
+    });
+
+    if (over || expired) {
+      try {
+        if (typeof disableVPNAccess === "function") {
+          await disableVPNAccess(username);
+        } else {
+          console.log("disableVPNAccess not defined; skipping external VPN disable.");
+        }
+      } catch (e) {
+        console.warn("update-usage: disableVPNAccess error:", e.message || e);
+      }
+      await sendUserNotification(
+        username,
+        "plan_exhausted",
+        over
+          ? "🚫 Your data plan has been exhausted. Please purchase a new plan to continue using VPN."
+          : "⌛ Your plan has expired. Please renew to re-enable VPN."
+      );
+    }
+
+    res.json({ success: true, consumed: consumeRes.consumed, stillNeeded: consumeRes.stillNeeded, totalRemaining: consumeRes.totalRemaining, totalAllocatedMB: consumeRes.totalAllocatedMB, totalUsedMB: consumeRes.totalUsedMB, progressPercent: consumeRes.progressPercent });
+  } catch (err) {
+    console.error("Usage update error:", err.message || err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ----------------------
+// CRON JOBS
+app.all("/cron/expire-check", async (_, res) => {
+  try {
+    const now = new Date();
+    const snap = await db.collection("users").get();
+    let disabled = 0;
+
+    for (const doc of snap.docs) {
+      const userRef = doc.ref;
+
+      // Normalize buckets for each user (mark expired/exhausted and update totals)
+      try {
+        const pr = await normalizeBucketStatuses(userRef);
+        // if normalization left zero active plans, increment disabled and ensure VPN disabled
+        if (pr.remainingCount === 0) {
+          disabled++;
+        }
+      } catch (e) {
+        console.warn(`cron normalize error for ${doc.id}:`, e.message || e);
+      }
+    }
+
+    res.status(200).send(`✅ Normalized plans for ${snap.size} users; ${disabled} users disabled (no active plans)`);
+  } catch (err) {
+    console.error("Cron expire-check error:", err.message || err);
+    res.status(500).send(err.message);
+  }
+});
+
+// Periodic tailscale-sync (keeps tailscale_nodes updated). you can call this endpoint via scheduler
+app.get("/cron/tailscale-sync", requireAdmin, async (_, res) => {
+  try {
+    const devices = await tailscaleListDevices();
+    let synced = 0;
+    for (const d of devices) {
+      const deviceId = d.id || d.node_id || d.key || d.idString;
+      const hostname = d.hostname || d.name || null;
+      const ip = (d.allAddresses && d.allAddresses[0]) || d.addresses?.[0] || null;
+      const user = d.user || d.userName || null;
+      const online = d.online !== undefined ? !!d.online : true;
+
+      await upsertNode({
+        deviceId,
+        hostname,
+        ip,
+        user,
+        assignedTo: null,
+        status: "free",
+        load: 0.0,
+        online,
+      });
+      synced++;
+    }
+    res.json({ success: true, synced });
+  } catch (err) {
+    console.error("Tailscale sync error:", err.message || err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ----------------------
+// Misc. Test Endpoints
+app.post("/notify/test", async (req, res) => {
+  try {
+    const { email, message = "Test notification" } = req.body;
+    if (!email) return res.status(400).json({ error: "Email required" });
+
+    await sendUserNotification(email, "test", message);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/vpn/disable", async (req, res) => {
+  try {
+    const { username } = req.body;
+    if (!username) return res.status(400).json({ error: "username required" });
+
+    const result = await (async () => {
+      // attempt to disable via tailscale + optional external vpn endpoint
+      try {
+        await disableVPNAccess(username);
+      } catch (e) {
+        console.warn("vpn/disable disableVPNAccess error", e.message || e);
+      }
+      return { ok: true };
+    })();
+
+    res.json({ success: result.ok, result });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 // --- Start Server ---
 const PORT = process.env.PORT || 8080;
