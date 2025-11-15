@@ -1530,5 +1530,6 @@ app.post("/vpn/disable", async (req, res) => {
 });
 
 // --- Start Server ---
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log(`🚀 SureData backend running on port ${PORT}`));
+// Changed default port to 3000 and listen on 0.0.0.0 so Tailscale interface can reach it.
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, "0.0.0.0", () => console.log(`🚀 SureData backend running on port ${PORT} (listening on 0.0.0.0)`));
